@@ -1,0 +1,80 @@
+# openenv.yaml — SME Credit Risk RL Environment Manifest
+# ========================================================
+# Used by `openenv push` to configure the HF Space deployment.
+#
+# Deploy:
+#   openenv push --repo-id YOUR_USERNAME/sme-credit-env
+#
+# After deployment your environment is live at:
+#   https://YOUR_USERNAME-sme-credit-env.hf.space
+
+name: sme-credit-env
+version: "1.0.0"
+description: >
+  Multi-step RL environment for SME loan decisions.
+  An agent reveals financial factors one at a time then makes a
+  final approve / reject / refer decision.
+  Supports 50 synthetic applications across easy / medium / hard tiers.
+
+# HF Spaces hardware (free tier is sufficient for development)
+hardware: cpu-basic   # cpu-basic (free) | cpu-upgrade | t4-small | a10g-small
+
+# Port must match the CMD in Dockerfile
+port: 7860
+
+# Environment variables injected into the container at runtime
+env:
+  WORKERS: "2"
+  PORT: "7860"
+  HOST: "0.0.0.0"
+
+# Action space documentation (informational — not enforced by OpenEnv)
+actions:
+  assess:
+    - assess_revenue
+    - assess_credit_score
+    - assess_dti
+    - assess_collateral
+    - assess_business_age
+    - assess_cash_flow
+  decide:
+    - decide_approve
+    - decide_reject
+    - decide_refer
+
+# Observation fields visible to the agent
+observation_fields:
+  always_visible:
+    - application_id
+    - task_id
+    - business_name
+    - sector
+    - loan_amount
+  revealable:
+    - annual_revenue
+    - credit_score
+    - dti
+    - collateral_value
+    - business_age_years
+    - cash_flow_volatility
+  derived:
+    - loan_to_revenue   # auto-computed when annual_revenue is revealed
+
+# Reward structure (informational)
+rewards:
+  reveal_informative: +0.10
+  reveal_neutral:     +0.05
+  reveal_duplicate:   -0.05
+  invalid_action:     -0.10
+  decide_correct_easy_medium: +1.00
+  decide_correct_hard:        +1.20
+  decide_refer:               +0.30
+  decide_wrong:               -0.50
+  efficiency_bonus_per_saved: +0.05
+  timeout_penalty:            -0.20
+
+# Task distribution
+tasks:
+  easy:   10   # Clear single-factor decisions
+  medium: 20   # Multi-factor decisions
+  hard:   20   # Conflicting signals, borderline cases
