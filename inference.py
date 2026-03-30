@@ -1,3 +1,28 @@
+"""
+inference.py — SME Credit Risk RL Agent
+=========================================
+A rule-driven + LLM-hybrid agent that plays full episodes.
+
+Modes:
+  local   → talks directly to LoanEnvironment (no server needed)
+  remote  → talks to the FastAPI server via HTTP
+
+MANDATORY environment variables (hackathon requirement):
+  API_BASE_URL   — LLM API endpoint, e.g. https://router.huggingface.co/v1
+  MODEL_NAME     — model identifier,  e.g. mistralai/Mistral-7B-Instruct-v0.2
+  HF_TOKEN       — Hugging Face / API key
+
+Usage
+-----
+  python inference.py                       # heuristic, local, easy tier
+  python inference.py --tier hard           # heuristic, hard tier
+  python inference.py --eval                # eval all tasks in default tier
+  python inference.py --eval --tier hard    # eval all hard tasks
+  python inference.py --llm --tier medium   # LLM agent, medium tier
+  python inference.py --mode remote --eval  # eval against running server
+  python inference.py --task easy_01        # single task by ID
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -8,22 +33,20 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# ✅ LOAD ENV FILE
-from dotenv import load_dotenv
-load_dotenv()
-
-# ✅ REQUIRED CLIENT
-from openai import OpenAI
-
-# =========================
-# ENV VARIABLES (MANDATORY)
-# =========================
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME", "mistralai/Mistral-7B-Instruct-v0.2")
+# ---------------------------------------------------------------------------
+# Mandatory env vars — read at module load (hackathon requirement)
+# ---------------------------------------------------------------------------
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "mistralai/Mistral-7B-Instruct-v0.2")
+API_KEY      = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY") or ""
 
 # ---------------------------------------------------------------------------
-# Path bootstrap
+# OpenAI-compatible client (MANDATORY for hackathon)
+# ---------------------------------------------------------------------------
+from openai import OpenAI as _OpenAIClient
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — make models / env importable from any cwd
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -34,9 +57,11 @@ from models import (
     LoanObservation,
     VALID_ACTIONS,
     ACTION_TO_FACTOR,
+    REVEALABLE_FACTORS,
 )
 from env.environment import LoanEnvironment, _load_tasks
 from env.graders import grade
+
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -58,247 +83,218 @@ Assess actions (reveal one hidden factor):
   - assess_business_age   → reveals business_age_years
   - assess_cash_flow      → reveals cash_flow_volatility (0=stable, 1=volatile)
 
-Decision actions (ENDS the episode — choose one):
-  - decide_approve        → approve the loan
-  - decide_reject         → reject the loan
-  - decide_refer          → refer to senior underwriter (borderline cases)
+Decision actions (ENDS the episode):
+  - decide_approve  → approve the loan
+  - decide_reject   → reject the loan
+  - decide_refer    → refer to senior underwriter (borderline cases)
 
-## RISK FRAMEWORK (use this to decide)
-APPROVE when risk is low:
-  ✓ Credit score ≥ 650
-  ✓ DTI ≤ 0.40
-  ✓ Loan-to-revenue ratio ≤ 0.50
-  ✓ Business age ≥ 2 years
-  ✓ Cash flow volatility ≤ 0.40
-  ✓ Strong collateral coverage
+## RISK FRAMEWORK
+APPROVE when risk is LOW:
+  ✓ credit_score ≥ 650
+  ✓ dti ≤ 0.40
+  ✓ loan-to-revenue ratio ≤ 0.50
+  ✓ business_age_years ≥ 2
+  ✓ cash_flow_volatility ≤ 0.40
 
-REJECT when risk is high:
-  ✗ Credit score < 500 (hard floor — always reject)
-  ✗ DTI > 0.80
-  ✗ Business age < 1 year with no collateral and large loan
-  ✗ Multiple severe negatives together
+REJECT when risk is HIGH:
+  ✗ credit_score < 500 (hard floor — always reject)
+  ✗ dti > 0.80
+  ✗ very young business (<1 yr) with large loan and no collateral
 
-REFER when signals are mixed:
-  - Some factors suggest approval, others suggest rejection
-  - Risk is borderline (cannot clearly approve or reject)
+REFER when signals are mixed / borderline.
 
 ## EFFICIENCY RULE
-You earn a bonus for FEWER reveals. Don't assess all 6 factors if you can
-decide confidently from fewer. A decisive agent scores higher than a
-thorough-but-slow one.
+You earn a bonus for FEWER reveals. Decide as soon as you have enough
+evidence — don't reveal all 6 factors if 2-3 are sufficient.
 
 ## RESPONSE FORMAT
-Respond with ONLY a JSON object — no prose, no markdown:
-{
-  "reasoning": "one sentence explaining your thinking",
-  "action_type": "assess_credit_score"
-}
-
-The action_type must be exactly one of the valid actions listed above.
+Respond with ONE JSON object only — no prose, no markdown fences:
+{"reasoning": "one sentence", "action_type": "assess_credit_score"}
 """.strip()
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Prompt builder
 # ---------------------------------------------------------------------------
 
 def _obs_to_prompt(obs: LoanObservation) -> str:
-    """Convert a LoanObservation into a concise text prompt for the LLM."""
     lines = [
-        f"APPLICATION: {obs.application_id}  |  Business: {obs.business_name}",
-        f"Sector: {obs.sector}  |  Loan requested: £{obs.loan_amount:,.0f}",
+        f"APPLICATION: {obs.application_id}  |  {obs.business_name}  ({obs.sector})",
+        f"Loan requested: £{obs.loan_amount:,.0f}",
         f"Step: {obs.step_count}/{obs.max_steps}  |  Cumulative reward: {obs.cumulative_reward:.3f}",
         "",
         "REVEALED FACTORS:",
     ]
-
-    factor_map = {
+    factor_display = {
         "annual_revenue":       ("Annual Revenue",       lambda v: f"£{v:,.0f}"),
         "credit_score":         ("Credit Score",         lambda v: str(v)),
         "dti":                  ("DTI Ratio",            lambda v: f"{v:.1%}"),
         "collateral_value":     ("Collateral Value",     lambda v: f"£{v:,.0f}"),
-        "business_age_years":   ("Business Age",         lambda v: f"{v:.1f} years"),
+        "business_age_years":   ("Business Age",         lambda v: f"{v:.1f} yrs"),
         "cash_flow_volatility": ("Cash Flow Volatility", lambda v: f"{v:.2f}"),
     }
-
-    revealed_any = False
-    for key, (label, fmt) in factor_map.items():
+    any_revealed = False
+    for key, (label, fmt) in factor_display.items():
         val = getattr(obs, key, None)
         if val is not None:
             lines.append(f"  {label:28s}: {fmt(val)}")
-            revealed_any = True
-
+            any_revealed = True
     if obs.loan_to_revenue is not None:
         lines.append(f"  {'Loan-to-Revenue':28s}: {obs.loan_to_revenue:.2f}x")
-
-    if not revealed_any:
+    if not any_revealed:
         lines.append("  (none revealed yet)")
-
     lines += [
         "",
         f"Factors still hidden: {obs.factors_remaining}",
-        f"Last action valid: {obs.last_action_valid}",
+        f"Last feedback: {obs.feedback}",
     ]
-    if obs.feedback:
-        lines.append(f"Last feedback: {obs.feedback}")
-
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# UPDATED LLM CALL (OpenAI + HF compatible)
+# LLM call — uses OpenAI-compatible client with mandatory env vars
 # ---------------------------------------------------------------------------
 
-def _call_llm(prompt: str, api_key: str, model: str = None) -> dict:
+def _call_llm(prompt: str) -> dict:
+    """
+    Call the LLM using the OpenAI-compatible client.
+    Reads API_BASE_URL, MODEL_NAME, API_KEY from module-level env vars.
+    Returns parsed JSON dict, or {} on any error (triggers heuristic fallback).
+    """
     try:
-        client = OpenAI(base_url=API_BASE_URL, api_key=api_key)
-
-        completion = client.chat.completions.create(
-            model=model or MODEL_NAME,
+        client = _OpenAIClient(base_url=API_BASE_URL, api_key=API_KEY or "no-key")
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
+                {"role": "user",   "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=256
+            max_tokens=256,
         )
-
-        text = completion.choices[0].message.content.strip()
-
-        # Clean markdown if present
+        text = response.choices[0].message.content or ""
+        text = text.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
-
         return json.loads(text.strip())
-
-    except Exception as e:
-        print(f"[LLM error: {e}] → fallback")
+    except Exception as exc:
+        print(f"  [LLM error: {exc}] → heuristic fallback")
         return {}
 
+
 # ---------------------------------------------------------------------------
-# HEURISTIC AGENT (UNCHANGED)
+# Heuristic agent — deterministic, no API key required
 # ---------------------------------------------------------------------------
+
 class HeuristicAgent:
     """
-    Deterministic rule-based agent.
-    Mirrors the risk formula from generate_dataset.py so it should achieve
-    near-perfect accuracy with minimal reveals.
+    Rule-based agent that mirrors the risk formula in generate_dataset.py.
+    Near-perfect accuracy on easy tasks; good on medium; reasonable on hard.
     """
 
-    # Priority order for reveals — most informative factors first
     REVEAL_PRIORITY = [
         "assess_credit_score",   # hard floor check
-        "assess_dti",            # second most predictive
-        "assess_revenue",        # needed for LTR
+        "assess_dti",            # second-most predictive
+        "assess_revenue",        # needed for loan-to-revenue ratio
         "assess_business_age",   # hard floor check
         "assess_collateral",     # discount factor
         "assess_cash_flow",      # least weight
     ]
 
     def choose_action(self, obs: LoanObservation) -> str:
-        """Return an action_type string based on current observation."""
-
-        # --- Hard-floor checks on revealed factors ---
+        # Hard floors — decide immediately
         if obs.credit_score is not None and obs.credit_score < 500:
             return "decide_reject"
-
         if obs.dti is not None and obs.dti > 0.80:
             return "decide_reject"
-
         if (
-            obs.business_age_years is not None
-            and obs.business_age_years < 1.0
+            obs.business_age_years is not None and obs.business_age_years < 1.0
             and obs.collateral_value is not None
             and obs.collateral_value < obs.loan_amount * 0.5
         ):
             return "decide_reject"
 
-        # --- Count strong signals if we have ≥ 3 factors ---
-        n_revealed = len(obs.factors_assessed)
-
-        if n_revealed >= 3:
-            positive_signals = 0
-            negative_signals = 0
-
+        # Signal counting once ≥ 3 factors revealed
+        n = len(obs.factors_assessed)
+        if n >= 3:
+            pos = neg = 0
             if obs.credit_score is not None:
-                if obs.credit_score >= 650:   positive_signals += 1
-                elif obs.credit_score < 550:  negative_signals += 1
-
+                if obs.credit_score >= 650:  pos += 1
+                elif obs.credit_score < 550: neg += 1
             if obs.dti is not None:
-                if obs.dti <= 0.40:   positive_signals += 1
-                elif obs.dti > 0.60:  negative_signals += 1
-
+                if obs.dti <= 0.40:  pos += 1
+                elif obs.dti > 0.60: neg += 1
             if obs.loan_to_revenue is not None:
-                if obs.loan_to_revenue <= 0.50:   positive_signals += 1
-                elif obs.loan_to_revenue > 1.0:   negative_signals += 1
-
+                if obs.loan_to_revenue <= 0.50:  pos += 1
+                elif obs.loan_to_revenue > 1.0:  neg += 1
             if obs.business_age_years is not None:
-                if obs.business_age_years >= 3:   positive_signals += 1
-                elif obs.business_age_years < 1:  negative_signals += 1
-
+                if obs.business_age_years >= 3:  pos += 1
+                elif obs.business_age_years < 1: neg += 1
             if obs.cash_flow_volatility is not None:
-                if obs.cash_flow_volatility <= 0.40:  positive_signals += 1
-                elif obs.cash_flow_volatility > 0.60: negative_signals += 1
-
+                if obs.cash_flow_volatility <= 0.40:  pos += 1
+                elif obs.cash_flow_volatility > 0.60: neg += 1
             if obs.collateral_value is not None:
                 cov = obs.collateral_value / max(obs.loan_amount, 1)
-                if cov >= 0.8:    positive_signals += 1
-                elif cov < 0.2:   negative_signals += 1
+                if cov >= 0.8:   pos += 1
+                elif cov < 0.2:  neg += 1
 
-            total_signals = positive_signals + negative_signals
-            if total_signals > 0:
-                pos_ratio = positive_signals / total_signals
-                if pos_ratio >= 0.75 and n_revealed >= 3:
-                    return "decide_approve"
-                if pos_ratio <= 0.30 and n_revealed >= 3:
-                    return "decide_reject"
-                # Borderline — refer if we've seen enough
-                if n_revealed >= 5:
-                    return "decide_refer"
+            total = pos + neg
+            if total > 0:
+                ratio = pos / total
+                if ratio >= 0.75 and n >= 3: return "decide_approve"
+                if ratio <= 0.30 and n >= 3: return "decide_reject"
+                if n >= 5:                   return "decide_refer"
 
-        # --- Reveal next hidden factor in priority order ---
+        # Reveal next hidden factor in priority order
         revealed = set(obs.factors_assessed)
-        for action in self.REVEAL_PRIORITY:
-            factor = ACTION_TO_FACTOR[action]
-            if factor not in revealed:
-                return action
+        for act in self.REVEAL_PRIORITY:
+            if ACTION_TO_FACTOR[act] not in revealed:
+                return act
 
-        # --- All factors revealed — make best decision ---
         return "decide_refer"
 
+
 # ---------------------------------------------------------------------------
-# LLM Agent (wraps heuristic with LLM override)
+# LLM agent — wraps heuristic with LLM override
 # ---------------------------------------------------------------------------
 
 class LLMAgent:
-    """
-    Uses Claude to pick actions. Falls back to heuristic on API errors.
-    """
+    """Uses the LLM to pick actions; falls back to heuristic on errors."""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
-        self.api_key = api_key
-        self.model = model
+    def __init__(self):
         self._heuristic = HeuristicAgent()
 
     def choose_action(self, obs: LoanObservation) -> tuple[str, str]:
-        """Returns (action_type, reasoning)."""
-        prompt = _obs_to_prompt(obs)
-        result = _call_llm(prompt, self.api_key, self.model)
-
+        """Returns (action_type, reasoning_string)."""
+        result     = _call_llm(_obs_to_prompt(obs))
         action_type = result.get("action_type", "")
-        reasoning   = result.get("reasoning", "LLM fallback")
+        reasoning   = result.get("reasoning", "")
 
-        # Validate — if LLM returned garbage, use heuristic
         if action_type not in VALID_ACTIONS:
             action_type = self._heuristic.choose_action(obs)
-            reasoning = f"[heuristic fallback] {reasoning}"
+            reasoning   = f"[heuristic fallback] {reasoning}"
 
         return action_type, reasoning
 
 
 # ---------------------------------------------------------------------------
-# Episode runner
+# Deserialise server JSON → LoanObservation
+# ---------------------------------------------------------------------------
+
+def _dict_to_obs(d: dict) -> LoanObservation:
+    """
+    Reconstruct a LoanObservation from a server JSON response dict.
+    LoanObservation is a plain dataclass so use dataclasses.fields().
+    """
+    valid_fields = {f.name for f in dataclasses.fields(LoanObservation)}
+    clean = {k: v for k, v in d.items() if k in valid_fields}
+    return LoanObservation(**clean)
+
+
+# ---------------------------------------------------------------------------
+# Local episode runner
 # ---------------------------------------------------------------------------
 
 def run_episode_local(
@@ -307,17 +303,12 @@ def run_episode_local(
     agent,
     verbose: bool = True,
 ) -> dict:
-    """
-    Run one full episode locally (no HTTP).
-    Returns a result dict with score and episode metadata.
-    """
     obs = env.reset(task_id)
 
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Episode: {obs.application_id}  [{obs.task_id.upper()}]")
-        print(f"  Business: {obs.business_name}  |  Sector: {obs.sector}")
-        print(f"  Loan: £{obs.loan_amount:,.0f}")
+        print(f"  {obs.business_name}  ({obs.sector})  |  £{obs.loan_amount:,.0f}")
         print(f"{'='*60}")
 
     while not obs.done:
@@ -331,45 +322,49 @@ def run_episode_local(
             if verbose:
                 print(f"\n  Step {obs.step_count + 1}: {action_type}")
 
-        action = LoanAction(action_type=action_type, application_id=obs.application_id)
-        obs = env.step(action)
+        obs = env.step(LoanAction(
+            action_type=action_type,
+            application_id=obs.application_id,
+        ))
 
         if verbose:
             print(f"  → Reward: {obs.reward:+.3f}  |  Cumulative: {obs.cumulative_reward:.3f}")
             if obs.feedback:
                 print(f"  → {obs.feedback}")
 
-    # Grade the episode
-    state = env.state
-    episode_score = grade(
-        action_log=state.action_log,
-        ground_truth=state.ground_truth_decision,
-        task_id=state.task_id,
+    st    = env.state
+    score = grade(
+        action_log=st.action_log,
+        ground_truth=st.ground_truth_decision,
+        task_id=st.task_id,
     )
 
     result = {
         "application_id":    obs.application_id,
         "task_id":           obs.task_id,
         "final_decision":    obs.final_decision,
-        "ground_truth":      state.ground_truth_decision,
-        "correct":           obs.final_decision == state.ground_truth_decision,
-        "cumulative_reward": state.cumulative_reward,
-        "n_reveals":         len([e for e in state.action_log if e["action_type"].startswith("assess_")]),
-        "n_steps":           state.step_count,
-        "grade_score":       episode_score,
-        "penalties":         state.penalty_total,
+        "ground_truth":      st.ground_truth_decision,
+        "correct":           obs.final_decision == st.ground_truth_decision,
+        "cumulative_reward": st.cumulative_reward,
+        "n_reveals":         sum(1 for e in st.action_log
+                                 if e["action_type"].startswith("assess_") and e["valid"]),
+        "n_steps":           st.step_count,
+        "grade_score":       score,
+        "penalties":         st.penalty_total,
     }
 
     if verbose:
-        correct_str = "✓ CORRECT" if result["correct"] else "✗ WRONG"
+        mark = "✓ CORRECT" if result["correct"] else "✗ WRONG"
         print(f"\n  {'─'*50}")
-        print(f"  Decision: {obs.final_decision.upper():10s}  Ground truth: {state.ground_truth_decision.upper()}")
-        print(f"  Outcome:  {correct_str}")
-        print(f"  Reward:   {state.cumulative_reward:.4f}   Grade score: {episode_score:.4f}")
-        print(f"  Reveals:  {result['n_reveals']} / 6   Steps: {result['n_steps']}")
+        print(f"  Decision: {obs.final_decision.upper():10s}  GT: {st.ground_truth_decision.upper()}")
+        print(f"  {mark}  |  Grade: {score:.4f}  |  Reveals: {result['n_reveals']}/6")
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# Remote episode runner
+# ---------------------------------------------------------------------------
 
 def run_episode_remote(
     base_url: str,
@@ -377,46 +372,34 @@ def run_episode_remote(
     agent,
     verbose: bool = True,
 ) -> dict:
-    """
-    Run one full episode against a remote FastAPI server.
-    """
     import requests
 
-    def _reset(tid: str) -> dict:
-        r = requests.post(f"{base_url}/reset", json={"task_id": tid}, timeout=10)
-        r.raise_for_status()
-        return r.json()
+    def _reset(tid):
+        r = requests.post(f"{base_url}/reset", json={"task_id": tid}, timeout=15)
+        r.raise_for_status(); return r.json()
 
-    def _step(action_type: str, application_id: str) -> dict:
-        r = requests.post(
-            f"{base_url}/step",
-            json={"action_type": action_type, "application_id": application_id},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
+    def _step(atype, app_id):
+        r = requests.post(f"{base_url}/step",
+                          json={"action_type": atype, "application_id": app_id},
+                          timeout=15)
+        r.raise_for_status(); return r.json()
 
-    def _state() -> dict:
+    def _state():
         r = requests.get(f"{base_url}/state", timeout=10)
-        r.raise_for_status()
-        return r.json()
+        r.raise_for_status(); return r.json()
 
-    def _grade(action_log, ground_truth, task_id_str) -> dict:
-        r = requests.post(
-            f"{base_url}/grade",
-            json={"action_log": action_log, "ground_truth": ground_truth, "task_id": task_id_str},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
+    def _grade_remote(log, gt, tid_str):
+        r = requests.post(f"{base_url}/grade",
+                          json={"action_log": log, "ground_truth": gt, "task_id": tid_str},
+                          timeout=10)
+        r.raise_for_status(); return r.json()
 
-    obs_dict = _reset(task_id)
-    obs = _dict_to_obs(obs_dict)
+    obs = _dict_to_obs(_reset(task_id))
 
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Episode (remote): {obs.application_id}  [{obs.task_id.upper()}]")
-        print(f"  Business: {obs.business_name}  |  Loan: £{obs.loan_amount:,.0f}")
+        print(f"  {obs.business_name}  |  £{obs.loan_amount:,.0f}")
         print(f"{'='*60}")
 
     while not obs.done:
@@ -430,52 +413,41 @@ def run_episode_remote(
             if verbose:
                 print(f"\n  Step {obs.step_count + 1}: {action_type}")
 
-        obs_dict = _step(action_type, obs.application_id)
-        obs = _dict_to_obs(obs_dict)
-
+        obs = _dict_to_obs(_step(action_type, obs.application_id))
         if verbose:
             print(f"  → Reward: {obs.reward:+.3f}  |  {obs.feedback[:80]}")
 
-    state_dict = _state()
-    grade_resp  = _grade(
-        state_dict.get("action_log", []),
-        state_dict.get("ground_truth_decision", ""),
-        state_dict.get("task_id", "easy"),
+    st_dict    = _state()
+    grade_resp = _grade_remote(
+        st_dict.get("action_log", []),
+        st_dict.get("ground_truth_decision", ""),
+        st_dict.get("task_id", "easy"),
     )
 
     result = {
         "application_id":    obs.application_id,
         "task_id":           obs.task_id,
         "final_decision":    obs.final_decision,
-        "ground_truth":      state_dict.get("ground_truth_decision"),
+        "ground_truth":      st_dict.get("ground_truth_decision"),
         "correct":           grade_resp.get("correct", False),
-        "cumulative_reward": state_dict.get("cumulative_reward", 0),
+        "cumulative_reward": st_dict.get("cumulative_reward", 0),
         "n_reveals":         grade_resp.get("n_reveals", 0),
-        "n_steps":           state_dict.get("step_count", 0),
+        "n_steps":           st_dict.get("step_count", 0),
         "grade_score":       grade_resp.get("score", 0.0),
-        "penalties":         state_dict.get("penalty_total", 0.0),
+        "penalties":         st_dict.get("penalty_total", 0.0),
     }
 
     if verbose:
-        correct_str = "✓ CORRECT" if result["correct"] else "✗ WRONG"
+        mark = "✓ CORRECT" if result["correct"] else "✗ WRONG"
         print(f"\n  {'─'*50}")
-        print(f"  Decision: {obs.final_decision.upper():10s}  Ground truth: {result['ground_truth'].upper()}")
-        print(f"  Outcome:  {correct_str}")
-        print(f"  Grade score: {result['grade_score']:.4f}")
+        print(f"  Decision: {obs.final_decision.upper()}  GT: {result['ground_truth'].upper()}")
+        print(f"  {mark}  |  Grade: {result['grade_score']:.4f}")
 
     return result
 
 
-def _dict_to_obs(d: dict) -> LoanObservation:
-    """Reconstruct a LoanObservation from a server JSON response dict."""
-    # Remove keys that aren't LoanObservation fields
-    valid_fields = {f.name for f in dataclasses.fields(LoanObservation)}
-    clean = {k: v for k, v in d.items() if k in valid_fields}
-    return LoanObservation(**clean)
-
-
 # ---------------------------------------------------------------------------
-# Full evaluation across a tier or all tiers
+# Full evaluation runner
 # ---------------------------------------------------------------------------
 
 def run_evaluation(
@@ -485,92 +457,67 @@ def run_evaluation(
     base_url: str = "http://localhost:7860",
     verbose: bool = False,
 ) -> dict:
-    """
-    Run every task in a tier (or all tiers) and print a summary table.
-
-    Returns a dict with per-tier and overall statistics.
-    """
-    all_tasks = _load_tasks()
-
-    if tier:
-        tasks_to_run = [t for t in all_tasks if t["task_id"] == tier]
-    else:
-        tasks_to_run = all_tasks
+    all_tasks    = _load_tasks()
+    tasks_to_run = [t for t in all_tasks if t["task_id"] == tier] if tier else all_tasks
 
     if not tasks_to_run:
         print(f"No tasks found for tier '{tier}'")
         return {}
 
     env = LoanEnvironment() if mode == "local" else None
-    results = []
 
     print(f"\n{'='*60}")
-    print(f"  SME Credit Risk Agent — Evaluation")
-    print(f"  Mode: {mode.upper()}   Agent: {type(agent).__name__}")
-    print(f"  Tasks: {len(tasks_to_run)}")
+    print(f"  SME Credit Risk — Evaluation")
+    print(f"  Mode: {mode.upper()}  Agent: {type(agent).__name__}  Tasks: {len(tasks_to_run)}")
     print(f"{'='*60}\n")
 
+    results = []
     for task in tasks_to_run:
         tid = task["application_id"]
         try:
             if mode == "local":
-                result = run_episode_local(env, tid, agent, verbose=verbose)
+                r = run_episode_local(env, tid, agent, verbose=verbose)
             else:
-                result = run_episode_remote(base_url, tid, agent, verbose=verbose)
-            results.append(result)
-            status = "✓" if result["correct"] else "✗"
+                r = run_episode_remote(base_url, tid, agent, verbose=verbose)
+            results.append(r)
+            mark = "✓" if r["correct"] else "✗"
             print(
-                f"  {status} {tid:12s} [{result['task_id']:6s}]  "
-                f"decision={result['final_decision']:7s}  "
-                f"gt={result['ground_truth']:7s}  "
-                f"score={result['grade_score']:.3f}  "
-                f"reveals={result['n_reveals']}"
+                f"  {mark} {tid:12s} [{r['task_id']:6s}]  "
+                f"decision={r['final_decision']:7s}  gt={r['ground_truth']:7s}  "
+                f"score={r['grade_score']:.3f}  reveals={r['n_reveals']}"
             )
-        except Exception as e:
-            print(f"  ! {tid:12s} ERROR: {e}")
+        except Exception as exc:
+            print(f"  ! {tid:12s} ERROR: {exc}")
 
     if not results:
         return {}
 
-    # Summary by tier
     print(f"\n{'─'*60}")
-    print(f"  SUMMARY")
-    print(f"{'─'*60}")
-
     by_tier: dict[str, list] = {}
     for r in results:
         by_tier.setdefault(r["task_id"], []).append(r)
 
-    overall_scores = []
+    all_scores = []
     for t in ["easy", "medium", "hard"]:
-        if t not in by_tier:
-            continue
-        tier_results = by_tier[t]
-        n = len(tier_results)
-        n_correct  = sum(1 for r in tier_results if r["correct"])
-        avg_score  = sum(r["grade_score"] for r in tier_results) / n
-        avg_reveals = sum(r["n_reveals"] for r in tier_results) / n
-        avg_reward  = sum(r["cumulative_reward"] for r in tier_results) / n
-        overall_scores.extend(r["grade_score"] for r in tier_results)
+        if t not in by_tier: continue
+        tr     = by_tier[t]
+        n      = len(tr)
+        n_ok   = sum(1 for r in tr if r["correct"])
+        avg_sc = sum(r["grade_score"] for r in tr) / n
+        avg_rv = sum(r["n_reveals"]   for r in tr) / n
+        all_scores.extend(r["grade_score"] for r in tr)
+        print(f"  {t.upper():6s}  accuracy={n_ok}/{n}  avg_score={avg_sc:.3f}  avg_reveals={avg_rv:.1f}")
 
-        print(
-            f"  {t.upper():6s}  accuracy={n_correct}/{n}  "
-            f"avg_score={avg_score:.3f}  "
-            f"avg_reveals={avg_reveals:.1f}  "
-            f"avg_reward={avg_reward:.3f}"
-        )
-
-    overall_avg = sum(overall_scores) / len(overall_scores)
-    n_total = len(results)
-    n_correct_total = sum(1 for r in results if r["correct"])
-    print(f"\n  OVERALL  accuracy={n_correct_total}/{n_total}  avg_score={overall_avg:.3f}")
+    overall = sum(all_scores) / len(all_scores)
+    n_ok_total = sum(1 for r in results if r["correct"])
+    print(f"\n  OVERALL  accuracy={n_ok_total}/{len(results)}  avg_score={overall:.3f}")
     print(f"{'='*60}\n")
 
     return {
-        "results":      results,
-        "by_tier":      {t: by_tier[t] for t in by_tier},
-        "overall_score": overall_avg,
-        "accuracy":     n_correct_total / n_total,
+        "results":       results,
+        "by_tier":       by_tier,
+        "overall_score": overall,
+        "accuracy":      n_ok_total / len(results),
     }
 
 
@@ -579,27 +526,51 @@ def run_evaluation(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--llm", action="store_true")
-    parser.add_argument("--tier", default=None)
+    parser = argparse.ArgumentParser(description="SME Credit Risk RL Agent")
+    parser.add_argument("--mode",    default="local",  choices=["local", "remote"])
+    parser.add_argument("--url",     default=os.environ.get("SME_ENV_URL", "http://localhost:7860"))
+    parser.add_argument("--tier",    default=None, choices=["easy", "medium", "hard"])
+    parser.add_argument("--task",    default=None, help="Single task by application_id")
+    parser.add_argument("--eval",    action="store_true", help="Evaluate full tier (or all tiers)")
+    parser.add_argument("--all",     action="store_true", help="Evaluate all tiers")
+    parser.add_argument("--llm",     action="store_true", help="Use LLM agent")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     if args.llm:
-        # 🔥 FIXED API KEY LOADING
-        api_key = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY")
-
-        if not api_key:
-            print("ERROR: Set HF_TOKEN or API_KEY in .env file")
-            sys.exit(1)
-
-        agent = LLMAgent(api_key=api_key, model=MODEL_NAME)
-        print(f"Agent: LLM ({MODEL_NAME})")
-
+        if not API_KEY:
+            print("WARNING: HF_TOKEN / API_KEY not set. Set with:")
+            print("  export HF_TOKEN=hf_your_token_here")
+            print("Continuing — some providers work without a key.")
+        agent = LLMAgent()
+        print(f"Agent: LLM  model={MODEL_NAME}  base={API_BASE_URL}")
     else:
         agent = HeuristicAgent()
-        print("Agent: Heuristic")
+        print("Agent: Heuristic (deterministic, no API key needed)")
 
-    run_evaluation(agent, tier=args.tier)
+    if args.eval or args.all:
+        eval_tier = None if args.all else (args.tier or "easy")
+        run_evaluation(agent, mode=args.mode, tier=eval_tier,
+                       base_url=args.url, verbose=args.verbose)
+
+    elif args.task:
+        if args.mode == "local":
+            run_episode_local(LoanEnvironment(), args.task, agent, verbose=True)
+        else:
+            run_episode_remote(args.url, args.task, agent, verbose=True)
+
+    else:
+        all_tasks  = _load_tasks()
+        use_tier   = args.tier or "easy"
+        tier_tasks = [t for t in all_tasks if t["task_id"] == use_tier]
+        if not tier_tasks:
+            print(f"No tasks for tier '{use_tier}'")
+            sys.exit(1)
+        tid = tier_tasks[0]["application_id"]
+        if args.mode == "local":
+            run_episode_local(LoanEnvironment(), tid, agent, verbose=True)
+        else:
+            run_episode_remote(args.url, tid, agent, verbose=True)
 
 
 if __name__ == "__main__":

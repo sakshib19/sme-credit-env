@@ -286,9 +286,3 @@ python inference.py --mode remote --eval --all
 │  (ground truth)  │  easy / medium / hard
 └──────────────────┘
 ```
-
----
-
-## License
-
-MIT
