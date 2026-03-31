@@ -10,29 +10,17 @@ Modes:
 MANDATORY environment variables (hackathon requirement):
   API_BASE_URL   — LLM API endpoint, e.g. https://router.huggingface.co/v1
   MODEL_NAME     — model identifier,  e.g. Qwen/Qwen2.5-72B-Instruct
-  HF_TOKEN       — Hugging Face token (get one free at huggingface.co/settings/tokens)
-
-.env file (recommended — place in project root):
-  API_BASE_URL=https://router.huggingface.co/v1
-  MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
-  HF_TOKEN=hf_your_token_here
+  HF_TOKEN       — Hugging Face / API key
 
 Usage
 -----
-  python inference.py                          # heuristic, local, easy tier
-  python inference.py --tier hard              # heuristic, hard tier
-  python inference.py --eval --all             # heuristic, all 50 tasks
-  python inference.py --llm --tier medium      # LLM agent, medium tier
-  python inference.py --llm --eval --all       # LLM agent, all 50 tasks
-  python inference.py --mode remote --eval     # eval against running server
-  python inference.py --task easy_01           # single task by ID
-
-Supported models on HF router free tier (set in .env as MODEL_NAME):
-  Qwen/Qwen2.5-72B-Instruct          <- recommended (best JSON + reasoning)
-  Qwen/Qwen2.5-7B-Instruct           <- faster, use if rate-limited
-  meta-llama/Llama-3.3-70B-Instruct  <- excellent alternative
-  meta-llama/Llama-3.1-8B-Instruct   <- fast, smaller
-  mistralai/Mistral-7B-Instruct-v0.3 <- note: v0.3 NOT v0.2
+  python inference.py                       # heuristic, local, easy tier
+  python inference.py --tier hard           # heuristic, hard tier
+  python inference.py --eval                # eval all tasks in default tier
+  python inference.py --eval --tier hard    # eval all hard tasks
+  python inference.py --llm --tier medium   # LLM agent, medium tier
+  python inference.py --mode remote --eval  # eval against running server
+  python inference.py --task easy_01        # single task by ID
 """
 
 from __future__ import annotations
@@ -42,43 +30,41 @@ import dataclasses
 import json
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Load .env FIRST — before reading any env vars
+# Load .env file FIRST — before reading any env vars
+# python-dotenv loads .env from the current working directory (or any parent).
+# This means: cd into your project root, then run python inference.py.
 # ---------------------------------------------------------------------------
 try:
     from dotenv import load_dotenv
+    # override=False keeps real env vars (export) higher priority than .env
     _env_path = Path(__file__).resolve().parent / ".env"
     if _env_path.exists():
         load_dotenv(dotenv_path=_env_path, override=False)
         print(f"[info] Loaded .env from {_env_path}")
     else:
-        load_dotenv(override=False)
+        load_dotenv(override=False)   # search parent dirs
 except ImportError:
-    pass  # rely on exported env vars
+    pass   # python-dotenv not installed — rely on exported env vars
 
 # ---------------------------------------------------------------------------
-# Mandatory env vars — read AFTER load_dotenv()
-# Strip surrounding quotes/whitespace that some .env editors add
+# Mandatory env vars (hackathon requirement)
+# Read AFTER load_dotenv() so .env values are visible to os.environ.get()
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1").strip().strip('"').strip("'")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct").strip().strip('"').strip("'")
 API_KEY      = (os.environ.get("HF_TOKEN") or os.environ.get("API_KEY") or "").strip().strip('"').strip("'")
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible client (mandatory for hackathon — works with HF router)
+# OpenAI-compatible client (MANDATORY for hackathon)
 # ---------------------------------------------------------------------------
-try:
-    from openai import OpenAI as _OpenAIClient
-except ImportError:
-    print("ERROR: openai package not installed. Run: pip install openai")
-    sys.exit(1)
+from openai import OpenAI as _OpenAIClient
 
 # ---------------------------------------------------------------------------
-# Path bootstrap
+# Path bootstrap — make models / env importable from any cwd
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -96,58 +82,60 @@ from env.graders import grade
 
 
 # ---------------------------------------------------------------------------
-# Models that support json_object response format on HF router
-# ---------------------------------------------------------------------------
-_JSON_FORMAT_SUPPORTED = {
-    "Qwen/Qwen2.5-72B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-32B-Instruct",
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "meta-llama/Llama-3.1-70B-Instruct",
-    "meta-llama/Meta-Llama-3-8B-Instruct",
-}
-
-
-# ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """
 You are an expert SME (Small and Medium Enterprise) credit underwriter.
-You are evaluating a loan application step-by-step.
-
-## YOUR TASK
-Decide whether to APPROVE, REJECT, or REFER a business loan application.
-You must gather financial evidence first, then make your decision.
+Evaluate loan applications step-by-step. Reveal financial factors one at
+a time, then make a final decision.
 
 ## AVAILABLE ACTIONS
-Assess actions (reveal one hidden factor):
-  - assess_revenue        -> reveals annual_revenue (GBP)
-  - assess_credit_score   -> reveals credit_score (300-850)
-  - assess_dti            -> reveals dti (debt-to-income ratio 0.0-1.0)
-  - assess_collateral     -> reveals collateral_value (GBP, 0 = unsecured)
-  - assess_business_age   -> reveals business_age_years
-  - assess_cash_flow      -> reveals cash_flow_volatility (0=stable, 1=volatile)
+Assess (reveal one hidden factor):
+  - assess_credit_score   → credit_score (300–850, higher = better)
+  - assess_dti            → dti (debt-to-income 0.0–1.0, lower = better)
+  - assess_revenue        → annual_revenue in GBP (also reveals loan_to_revenue)
+  - assess_business_age   → business_age_years (higher = better)
+  - assess_collateral     → collateral_value in GBP (higher = better)
+  - assess_cash_flow      → cash_flow_volatility (0=stable, 1=volatile, lower = better)
 
-Decision actions (ENDS the episode):
-  - decide_approve  -> approve the loan
-  - decide_reject   -> reject the loan
-  - decide_refer    -> refer to senior underwriter (borderline cases)
+Decide (ends the episode — pick exactly one):
+  - decide_approve  → approve the loan
+  - decide_reject   → reject the loan
+  - decide_refer    → refer to senior underwriter
 
-## RISK FRAMEWORK
-APPROVE when risk is LOW:
-  credit_score >= 650, dti <= 0.40, loan-to-revenue <= 0.50,
-  business_age_years >= 2, cash_flow_volatility <= 0.40
+## RISK SCORING (how the system actually scores applications)
+Each factor contributes a weighted penalty (0.0 = good, 1.0 = bad):
+  credit_score    weight 0.30  — (850 - score) / 550
+  dti             weight 0.25  — 0 if ≤0.30, scales to 1.0 at dti=1.0
+  loan_to_revenue weight 0.20  — 0 if ≤0.25, scales to 1.0 if >2.0
+  business_age    weight 0.15  — 0 if ≥5yrs, 0.9 if <1yr
+  cash_flow_vol   weight 0.10  — direct (0.4 = 0.4 penalty)
 
-REJECT when risk is HIGH:
-  credit_score < 500 (hard floor - always reject),
-  dti > 0.80, very young business (<1yr) with large loan and no collateral
+  risk_score = weighted_sum × (1 − 0.20 × collateral_coverage)
+    APPROVE  if risk_score < 0.35
+    REJECT   if risk_score > 0.65
+    REFER    otherwise (borderline)
 
-REFER when signals are mixed or borderline.
+## HARD FLOORS (always reject regardless of other factors)
+     credit_score STRICTLY BELOW 500 (i.e. credit_score ≤ 499)
+     dti > 0.80
+
+## KEY INSIGHT — ONE WEAK FACTOR ≠ REJECT
+  A credit score of 520 is weak but is NOT below 500.
+  If the other 5 factors are strong (low dti, low ltr, old business,
+  low volatility, high collateral), the application can still APPROVE.
+  NEVER reject on credit alone unless it is strictly below 500.
+  NEVER reject on a single negative signal — use the weighted picture.
+
+## DECISION GUIDE
+  APPROVE:  Most factors positive, risk_score likely < 0.35
+  REJECT:   Most factors negative, risk_score likely > 0.65, OR hard floor hit
+  REFER:    Mixed signals, risk_score likely 0.35–0.65
 
 ## EFFICIENCY RULE
-You earn a bonus for FEWER reveals. Decide as soon as you have enough
-evidence. Do not reveal all 6 factors if 2-3 are sufficient.
+  Reveal enough to be confident — usually 3–4 factors.
+  Each unrevealed factor earns a +0.05 efficiency bonus.
+  Don't over-reveal if the picture is already clear.
 
 ## RESPONSE FORMAT - CRITICAL
 Respond with ONLY a valid JSON object. No prose. No markdown. No code fences.
@@ -166,16 +154,16 @@ assess_business_age, assess_cash_flow, decide_approve, decide_reject, decide_ref
 def _obs_to_prompt(obs: LoanObservation) -> str:
     lines = [
         f"APPLICATION: {obs.application_id}  |  {obs.business_name}  ({obs.sector})",
-        f"Loan requested: GBP {obs.loan_amount:,.0f}",
+        f"Loan requested: ₹{obs.loan_amount:,.0f}",
         f"Step: {obs.step_count}/{obs.max_steps}  |  Cumulative reward: {obs.cumulative_reward:.3f}",
         "",
         "REVEALED FACTORS:",
     ]
     factor_display = {
-        "annual_revenue":       ("Annual Revenue",       lambda v: f"GBP {v:,.0f}"),
+        "annual_revenue":       ("Annual Revenue",       lambda v: f"₹{v:,.0f}"),
         "credit_score":         ("Credit Score",         lambda v: str(v)),
         "dti":                  ("DTI Ratio",            lambda v: f"{v:.1%}"),
-        "collateral_value":     ("Collateral Value",     lambda v: f"GBP {v:,.0f}"),
+        "collateral_value":     ("Collateral Value",     lambda v: f"₹{v:,.0f}"),
         "business_age_years":   ("Business Age",         lambda v: f"{v:.1f} yrs"),
         "cash_flow_volatility": ("Cash Flow Volatility", lambda v: f"{v:.2f}"),
     }
@@ -195,92 +183,41 @@ def _obs_to_prompt(obs: LoanObservation) -> str:
         f"Last feedback: {obs.feedback}",
         "",
         'Respond with JSON only: {"reasoning": "...", "action_type": "..."}',
-    ]
+        ]
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# LLM call — with JSON enforcement and retry logic
+# LLM call — uses OpenAI-compatible client with mandatory env vars
 # ---------------------------------------------------------------------------
 
-def _call_llm(prompt: str, max_retries: int = 2) -> dict:
+def _call_llm(prompt: str) -> dict:
     """
-    Call the LLM using the OpenAI-compatible client pointed at the HF router.
-
-    Fixes vs original:
-    - response_format={"type":"json_object"} enforced when model supports it
-    - Strips quotes/whitespace from env vars robustly
-    - Retries up to max_retries times with backoff on transient errors
-    - JSON extraction even when model adds surrounding prose
-    - Returns {} on failure -> triggers heuristic fallback in LLMAgent
+    Call the LLM using the OpenAI-compatible client.
+    Reads API_BASE_URL, MODEL_NAME, API_KEY from module-level env vars.
+    Returns parsed JSON dict, or {} on any error (triggers heuristic fallback).
     """
-    use_json_format = MODEL_NAME in _JSON_FORMAT_SUPPORTED
-
-    for attempt in range(max_retries + 1):
-        try:
-            client = _OpenAIClient(
-                base_url=API_BASE_URL,
-                api_key=API_KEY or "no-key",
-            )
-
-            kwargs = dict(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": prompt},
-                ],
-                temperature=0.1,   # low temp = deterministic, consistent JSON
-                max_tokens=200,
-            )
-
-            # Enforce JSON object output at API level (prevents markdown wrapping)
-            if use_json_format:
-                kwargs["response_format"] = {"type": "json_object"}
-
-            response = client.chat.completions.create(**kwargs)
-            text = (response.choices[0].message.content or "").strip()
-
-            # Strip markdown fences if model added them anyway
-            if "```" in text:
-                parts = text.split("```")
-                for part in parts:
-                    part = part.strip()
-                    if part.startswith("json"):
-                        part = part[4:].strip()
-                    if part.startswith("{"):
-                        text = part
-                        break
-
-            # Extract JSON object even if surrounded by prose
-            start = text.find("{")
-            end   = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                text = text[start:end]
-
-            parsed = json.loads(text)
-
-            # Validate action_type present and valid
-            action_type = parsed.get("action_type", "").strip()
-            if action_type in VALID_ACTIONS:
-                return parsed
-
-            print(f"  [LLM attempt {attempt+1}] invalid action_type='{action_type}', retrying...")
-
-        except json.JSONDecodeError as e:
-            print(f"  [LLM attempt {attempt+1}] JSON parse error: {e} — retrying...")
-        except Exception as e:
-            err_str = str(e)
-            # Do not retry on hard errors (auth, model not found, forbidden)
-            if any(code in err_str for code in ["401", "403", "model_not_supported"]):
-                print(f"  [LLM error: {e}] -> heuristic fallback")
-                return {}
-            print(f"  [LLM attempt {attempt+1}] error: {e} — retrying...")
-
-        if attempt < max_retries:
-            time.sleep(2 ** attempt)   # 1s then 2s backoff
-
-    print(f"  [LLM] all {max_retries+1} attempts failed -> heuristic fallback")
-    return {}
+    try:
+        client = _OpenAIClient(base_url=API_BASE_URL, api_key=API_KEY or "no-key")
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=256,
+        )
+        text = response.choices[0].message.content or ""
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception as exc:
+        print(f"  [LLM error: {exc}] → heuristic fallback")
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -290,64 +227,107 @@ def _call_llm(prompt: str, max_retries: int = 2) -> dict:
 class HeuristicAgent:
     """
     Rule-based agent that mirrors the risk formula in generate_dataset.py.
-    Near-perfect on easy; good on medium; reasonable on hard.
-    Serves as fallback when LLM fails.
+
+    Risk formula (weighted):
+      credit_score    0.30  penalty = (850 - score) / 550
+      dti             0.25  0 if <=0.30, scales up to 1.0
+      loan_to_revenue 0.20  0 if <=0.25, scales up
+      business_age    0.15  0 if >=5yr, 0.9 if <1yr
+      cash_flow_vol   0.10  direct value
+      collateral discount: × (1 - 0.20 × coverage)
+
+    APPROVE if risk < 0.35, REJECT if risk > 0.65, else REFER.
+    Hard floors: credit < 500 OR dti > 0.80 → always reject.
     """
 
     REVEAL_PRIORITY = [
-        "assess_credit_score",   # hard floor check first
-        "assess_dti",            # second-most predictive
-        "assess_revenue",        # needed for loan-to-revenue ratio
-        "assess_business_age",   # hard floor check
-        "assess_collateral",     # discount factor
-        "assess_cash_flow",      # least weight — reveal last
+        "assess_credit_score",   # highest weight (0.30), hard floor check
+        "assess_dti",            # second weight (0.25), hard floor check
+        "assess_revenue",        # reveals loan_to_revenue (weight 0.20)
+        "assess_business_age",   # weight 0.15
+        "assess_collateral",     # discount multiplier
+        "assess_cash_flow",      # lowest weight (0.10)
     ]
 
+    # ── Penalty functions matching generate_dataset.py exactly ──────────
+    @staticmethod
+    def _credit_penalty(s: float) -> float:
+        return max(0.0, min(1.0, (850 - s) / 550))
+
+    @staticmethod
+    def _dti_penalty(d: float) -> float:
+        if d <= 0.30: return 0.0
+        if d <= 0.45: return 0.2
+        if d <= 0.60: return 0.5
+        return min(1.0, 0.85 + (d - 0.60) * 0.75)
+
+    @staticmethod
+    def _ltr_penalty(l: float) -> float:
+        if l <= 0.25: return 0.0
+        if l <= 0.50: return 0.15
+        if l <= 1.00: return 0.40
+        if l <= 2.00: return 0.70
+        return 1.0
+
+    @staticmethod
+    def _age_penalty(a: float) -> float:
+        if a >= 5.0: return 0.0
+        if a >= 3.0: return 0.15
+        if a >= 2.0: return 0.35
+        if a >= 1.0: return 0.60
+        return 0.90
+
+    def _estimate_risk(self, obs: LoanObservation) -> float | None:
+        """
+        Compute weighted risk score from revealed factors.
+        Returns None if fewer than 3 factors revealed (not enough info).
+        Missing factors are estimated at 0.5 (uncertain/neutral).
+        """
+        n = len(obs.factors_assessed)
+        if n < 3:
+            return None
+
+        UNKNOWN = 0.5   # neutral estimate for unrevealed factors
+
+        cp  = self._credit_penalty(obs.credit_score) if obs.credit_score is not None else UNKNOWN
+        dp  = self._dti_penalty(obs.dti)             if obs.dti          is not None else UNKNOWN
+        ltr = obs.loan_to_revenue if obs.loan_to_revenue is not None else (
+              obs.loan_amount / max(obs.annual_revenue, 1) if obs.annual_revenue else UNKNOWN)
+        lp  = self._ltr_penalty(ltr) if not isinstance(ltr, float) or ltr != UNKNOWN else UNKNOWN
+        ap  = self._age_penalty(obs.business_age_years) if obs.business_age_years is not None else UNKNOWN
+        vp  = min(1.0, obs.cash_flow_volatility * 1.2)  if obs.cash_flow_volatility is not None else UNKNOWN
+
+        # Collateral coverage discount
+        if obs.collateral_value is not None:
+            cov      = obs.collateral_value / max(obs.loan_amount, 1)
+            discount = 1.0 - 0.20 * min(cov, 2.0)   # cap coverage at 2.0
+        else:
+            discount = 1.0   # no collateral info → no discount
+
+        raw = (cp * 0.30 + dp * 0.25 + lp * 0.20 + ap * 0.15 + vp * 0.10)
+        return round(raw * discount, 4)
+
     def choose_action(self, obs: LoanObservation) -> str:
-        # Hard floors — decide immediately
+        # ── Hard floors — immediate reject ────────────────────────────
         if obs.credit_score is not None and obs.credit_score < 500:
             return "decide_reject"
         if obs.dti is not None and obs.dti > 0.80:
             return "decide_reject"
-        if (
-            obs.business_age_years is not None and obs.business_age_years < 1.0
-            and obs.collateral_value is not None
-            and obs.collateral_value < obs.loan_amount * 0.5
-        ):
-            return "decide_reject"
 
-        # Signal counting once >= 3 factors revealed
+        # ── Estimate risk once we have enough data ────────────────────
         n = len(obs.factors_assessed)
-        if n >= 3:
-            pos = neg = 0
-            if obs.credit_score is not None:
-                if obs.credit_score >= 650:  pos += 1
-                elif obs.credit_score < 550: neg += 1
-            if obs.dti is not None:
-                if obs.dti <= 0.40:  pos += 1
-                elif obs.dti > 0.60: neg += 1
-            if obs.loan_to_revenue is not None:
-                if obs.loan_to_revenue <= 0.50:  pos += 1
-                elif obs.loan_to_revenue > 1.0:  neg += 1
-            if obs.business_age_years is not None:
-                if obs.business_age_years >= 3:  pos += 1
-                elif obs.business_age_years < 1: neg += 1
-            if obs.cash_flow_volatility is not None:
-                if obs.cash_flow_volatility <= 0.40:  pos += 1
-                elif obs.cash_flow_volatility > 0.60: neg += 1
-            if obs.collateral_value is not None:
-                cov = obs.collateral_value / max(obs.loan_amount, 1)
-                if cov >= 0.8:   pos += 1
-                elif cov < 0.2:  neg += 1
+        risk = self._estimate_risk(obs)
 
-            total = pos + neg
-            if total > 0:
-                ratio = pos / total
-                if ratio >= 0.75 and n >= 3: return "decide_approve"
-                if ratio <= 0.30 and n >= 3: return "decide_reject"
-                if n >= 5:                   return "decide_refer"
+        if risk is not None:
+            if risk < 0.35 and n >= 3:
+                return "decide_approve"
+            if risk > 0.65 and n >= 3:
+                return "decide_reject"
+            # Borderline: refer only after seeing enough factors
+            if risk >= 0.35 and n >= 5:
+                return "decide_refer"
 
-        # Reveal next hidden factor in priority order
+        # ── Reveal next hidden factor in priority order ───────────────
         revealed = set(obs.factors_assessed)
         for act in self.REVEAL_PRIORITY:
             if ACTION_TO_FACTOR[act] not in revealed:
@@ -357,7 +337,7 @@ class HeuristicAgent:
 
 
 # ---------------------------------------------------------------------------
-# LLM agent
+# LLM agent — wraps heuristic with LLM override
 # ---------------------------------------------------------------------------
 
 class LLMAgent:
@@ -365,44 +345,32 @@ class LLMAgent:
 
     def __init__(self):
         self._heuristic = HeuristicAgent()
-        self._llm_calls  = 0
-        self._llm_ok     = 0
-        self._fallbacks  = 0
 
     def choose_action(self, obs: LoanObservation) -> tuple[str, str]:
         """Returns (action_type, reasoning_string)."""
-        self._llm_calls += 1
-        result      = _call_llm(_obs_to_prompt(obs))
-        action_type = result.get("action_type", "").strip()
+        result     = _call_llm(_obs_to_prompt(obs))
+        action_type = result.get("action_type", "")
         reasoning   = result.get("reasoning", "")
 
-        if action_type in VALID_ACTIONS:
-            self._llm_ok += 1
-            return action_type, reasoning
+        if action_type not in VALID_ACTIONS:
+            action_type = self._heuristic.choose_action(obs)
+            reasoning   = f"[heuristic fallback] {reasoning}"
 
-        # LLM returned bad/empty action — use heuristic
-        self._fallbacks += 1
-        action_type = self._heuristic.choose_action(obs)
-        return action_type, f"[heuristic fallback] {reasoning}"
-
-    def stats(self) -> dict:
-        return {
-            "llm_calls":    self._llm_calls,
-            "llm_ok":       self._llm_ok,
-            "fallbacks":    self._fallbacks,
-            "success_rate": (self._llm_ok / self._llm_calls) if self._llm_calls else 0,
-        }
+        return action_type, reasoning
 
 
 # ---------------------------------------------------------------------------
-# Deserialise server JSON -> LoanObservation
+# Deserialise server JSON → LoanObservation
 # ---------------------------------------------------------------------------
 
 def _dict_to_obs(d: dict) -> LoanObservation:
+    """
+    Reconstruct a LoanObservation from a server JSON response dict.
+    LoanObservation is a plain dataclass so use dataclasses.fields().
+    """
     valid_fields = {f.name for f in dataclasses.fields(LoanObservation)}
     clean = {k: v for k, v in d.items() if k in valid_fields}
     return LoanObservation(**clean)
-
 
 # ---------------------------------------------------------------------------
 # Local episode runner
@@ -419,7 +387,7 @@ def run_episode_local(
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Episode: {obs.application_id}  [{obs.task_id.upper()}]")
-        print(f"  {obs.business_name}  ({obs.sector})  |  GBP {obs.loan_amount:,.0f}")
+        print(f"  {obs.business_name}  ({obs.sector})  |  ₹{obs.loan_amount:,.0f}")
         print(f"{'='*60}")
 
     while not obs.done:
@@ -439,9 +407,9 @@ def run_episode_local(
         ))
 
         if verbose:
-            print(f"  -> Reward: {obs.reward:+.3f}  |  Cumulative: {obs.cumulative_reward:.3f}")
+            print(f"  → Reward: {obs.reward:+.3f}  |  Cumulative: {obs.cumulative_reward:.3f}")
             if obs.feedback:
-                print(f"  -> {obs.feedback}")
+                print(f"  → {obs.feedback}")
 
     st    = env.state
     score = grade(
@@ -465,7 +433,7 @@ def run_episode_local(
     }
 
     if verbose:
-        mark = "CORRECT" if result["correct"] else "WRONG"
+        mark = "✓ CORRECT" if result["correct"] else "✗ WRONG"
         print(f"\n  {'─'*50}")
         print(f"  Decision: {obs.final_decision.upper():10s}  GT: {st.ground_truth_decision.upper()}")
         print(f"  {mark}  |  Grade: {score:.4f}  |  Reveals: {result['n_reveals']}/6")
@@ -487,34 +455,30 @@ def run_episode_remote(
 
     def _reset(tid):
         r = requests.post(f"{base_url}/reset", json={"task_id": tid}, timeout=15)
-        r.raise_for_status()
-        return r.json()
+        r.raise_for_status(); return r.json()
 
     def _step(atype, app_id):
         r = requests.post(f"{base_url}/step",
                           json={"action_type": atype, "application_id": app_id},
                           timeout=15)
-        r.raise_for_status()
-        return r.json()
+        r.raise_for_status(); return r.json()
 
     def _state():
         r = requests.get(f"{base_url}/state", timeout=10)
-        r.raise_for_status()
-        return r.json()
+        r.raise_for_status(); return r.json()
 
     def _grade_remote(log, gt, tid_str):
         r = requests.post(f"{base_url}/grade",
                           json={"action_log": log, "ground_truth": gt, "task_id": tid_str},
                           timeout=10)
-        r.raise_for_status()
-        return r.json()
+        r.raise_for_status(); return r.json()
 
     obs = _dict_to_obs(_reset(task_id))
 
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Episode (remote): {obs.application_id}  [{obs.task_id.upper()}]")
-        print(f"  {obs.business_name}  |  GBP {obs.loan_amount:,.0f}")
+        print(f"  {obs.business_name}  |  ₹{obs.loan_amount:,.0f}")
         print(f"{'='*60}")
 
     while not obs.done:
@@ -530,7 +494,7 @@ def run_episode_remote(
 
         obs = _dict_to_obs(_step(action_type, obs.application_id))
         if verbose:
-            print(f"  -> Reward: {obs.reward:+.3f}  |  {obs.feedback[:80]}")
+            print(f"  → Reward: {obs.reward:+.3f}  |  {obs.feedback[:80]}")
 
     st_dict    = _state()
     grade_resp = _grade_remote(
@@ -553,7 +517,7 @@ def run_episode_remote(
     }
 
     if verbose:
-        mark = "CORRECT" if result["correct"] else "WRONG"
+        mark = "✓ CORRECT" if result["correct"] else "✗ WRONG"
         print(f"\n  {'─'*50}")
         print(f"  Decision: {obs.final_decision.upper()}  GT: {result['ground_truth'].upper()}")
         print(f"  {mark}  |  Grade: {result['grade_score']:.4f}")
@@ -595,7 +559,7 @@ def run_evaluation(
             else:
                 r = run_episode_remote(base_url, tid, agent, verbose=verbose)
             results.append(r)
-            mark = "+" if r["correct"] else "-"
+            mark = "✓" if r["correct"] else "✗"
             print(
                 f"  {mark} {tid:12s} [{r['task_id']:6s}]  "
                 f"decision={r['final_decision']:7s}  gt={r['ground_truth']:7s}  "
@@ -614,36 +578,25 @@ def run_evaluation(
 
     all_scores = []
     for t in ["easy", "medium", "hard"]:
-        if t not in by_tier:
-            continue
+        if t not in by_tier: continue
         tr     = by_tier[t]
         n      = len(tr)
         n_ok   = sum(1 for r in tr if r["correct"])
         avg_sc = sum(r["grade_score"] for r in tr) / n
         avg_rv = sum(r["n_reveals"]   for r in tr) / n
-        avg_rw = sum(r["cumulative_reward"] for r in tr) / n
         all_scores.extend(r["grade_score"] for r in tr)
-        print(
-            f"  {t.upper():6s}  accuracy={n_ok}/{n}  "
-            f"avg_score={avg_sc:.3f}  avg_reveals={avg_rv:.1f}  avg_reward={avg_rw:.3f}"
-        )
+        print(f"  {t.upper():6s}  accuracy={n_ok}/{n}  avg_score={avg_sc:.3f}  avg_reveals={avg_rv:.1f}")
 
-    overall  = sum(all_scores) / len(all_scores)
-    n_ok_tot = sum(1 for r in results if r["correct"])
-    print(f"\n  OVERALL  accuracy={n_ok_tot}/{len(results)}  avg_score={overall:.3f}")
+    overall = sum(all_scores) / len(all_scores)
+    n_ok_total = sum(1 for r in results if r["correct"])
+    print(f"\n  OVERALL  accuracy={n_ok_total}/{len(results)}  avg_score={overall:.3f}")
     print(f"{'='*60}\n")
-
-    if isinstance(agent, LLMAgent):
-        stats = agent.stats()
-        print(f"  LLM stats: {stats['llm_ok']}/{stats['llm_calls']} calls succeeded "
-              f"({stats['success_rate']:.0%})  |  fallbacks: {stats['fallbacks']}")
-        print()
 
     return {
         "results":       results,
         "by_tier":       by_tier,
         "overall_score": overall,
-        "accuracy":      n_ok_tot / len(results),
+        "accuracy":      n_ok_total / len(results),
     }
 
 
@@ -652,57 +605,39 @@ def run_evaluation(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="SME Credit Risk RL Agent",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python inference.py                          # heuristic, easy tier
-  python inference.py --eval --all             # heuristic, all 50 tasks
-  python inference.py --llm --tier medium      # LLM on medium tier
-  python inference.py --llm --eval --all       # LLM, all 50 tasks
-  python inference.py --llm --task hard_04 --verbose
-  python inference.py --mode remote --eval --all
-
-Supported HF router models (set MODEL_NAME in .env):
-  Qwen/Qwen2.5-72B-Instruct          (recommended)
-  Qwen/Qwen2.5-7B-Instruct           (faster, if rate-limited)
-  meta-llama/Llama-3.3-70B-Instruct
-  meta-llama/Llama-3.1-8B-Instruct
-  mistralai/Mistral-7B-Instruct-v0.3  (NOT v0.2)
-        """,
-    )
+    parser = argparse.ArgumentParser(description="SME Credit Risk RL Agent")
     parser.add_argument("--mode",    default="local",  choices=["local", "remote"])
     parser.add_argument("--url",     default=os.environ.get("SME_ENV_URL", "http://localhost:7860"))
-    parser.add_argument("--tier",    default=None,     choices=["easy", "medium", "hard"])
-    parser.add_argument("--task",    default=None,     help="Single task by application_id")
-    parser.add_argument("--eval",    action="store_true")
+    parser.add_argument("--tier",    default=None, choices=["easy", "medium", "hard"])
+    parser.add_argument("--task",    default=None, help="Single task by application_id")
+    parser.add_argument("--eval",    action="store_true", help="Evaluate full tier (or all tiers)")
     parser.add_argument("--all",     action="store_true", help="Evaluate all tiers")
-    parser.add_argument("--llm",     action="store_true", help="Use LLM agent (requires HF_TOKEN in .env)")
+    parser.add_argument("--llm",     action="store_true", help="Use LLM agent")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    # Build agent
     if args.llm:
         if not API_KEY:
             print("ERROR: HF_TOKEN not found in environment or .env file.")
             print()
-            print("  Create sme-credit-env/.env with these contents:")
+            print("  Option 1 — create a .env file in your project root:")
             print("    API_BASE_URL=https://router.huggingface.co/v1")
-            print("    MODEL_NAME=Qwen/Qwen2.5-72B-Instruct")
+            print("    MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2")
             print("    HF_TOKEN=hf_your_token_here")
             print()
-            print("  Get a free token at: https://huggingface.co/settings/tokens")
-            sys.exit(1)
-
-        print(f"  HF_TOKEN loaded  (first 8 chars: {API_KEY[:8]}...)")
+            print("  Option 2 — set env vars directly:")
+            print("    Windows:  set HF_TOKEN=hf_your_token_here")
+            print("    Mac/Linux: export HF_TOKEN=hf_your_token_here")
+            print()
+            print("  Continuing anyway — using heuristic fallback for all steps.")
+        else:
+            print(f"  HF_TOKEN loaded ✓ (first 8 chars: {API_KEY[:8]}...)")
         agent = LLMAgent()
         print(f"Agent: LLM  model={MODEL_NAME}  base={API_BASE_URL}")
     else:
         agent = HeuristicAgent()
         print("Agent: Heuristic (deterministic, no API key needed)")
 
-    # Run
     if args.eval or args.all:
         eval_tier = None if args.all else (args.tier or "easy")
         run_evaluation(agent, mode=args.mode, tier=eval_tier,

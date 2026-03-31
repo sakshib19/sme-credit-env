@@ -240,14 +240,14 @@ python inference.py --mode remote --eval --all
 ============================================================
   Episode: hard_04  [HARD]
   Business: Ironbridge Technologies Ltd  |  Sector: technology
-  Loan: £200,000
+  Loan: ₹200,000
 ============================================================
 
   Step 1: assess_credit_score
   → Reward: +0.100  | Revealed credit_score = 690 [POSITIVE]
 
   Step 2: assess_collateral
-  → Reward: +0.100  | Revealed collateral_value = £550,000 [POSITIVE]
+  → Reward: +0.100  | Revealed collateral_value = ₹550,000 [POSITIVE]
 
   Step 3: assess_dti
   → Reward: +0.100  | Revealed dti = 0.300 [POSITIVE]
