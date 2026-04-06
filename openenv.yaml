@@ -1,80 +1,96 @@
-# openenv.yaml — SME Credit Risk RL Environment Manifest
-# ========================================================
-# Used by `openenv push` to configure the HF Space deployment.
+# openenv.yaml — SME Credit Risk RL Environment
+# ===============================================
+# Metadata manifest for OpenEnv Hub registration.
+# Used by: openenv validate, openenv push
 #
 # Deploy:
 #   openenv push --repo-id YOUR_USERNAME/sme-credit-env
 #
-# After deployment your environment is live at:
+# After deployment:
 #   https://YOUR_USERNAME-sme-credit-env.hf.space
 
 name: sme-credit-env
 version: "1.0.0"
 description: >
-  Multi-step RL environment for SME loan decisions.
-  An agent reveals financial factors one at a time then makes a
-  final approve / reject / refer decision.
-  Supports 50 synthetic applications across easy / medium / hard tiers.
+  Multi-step RL environment for SME loan underwriting.
+  An agent reveals financial factors one at a time, computes a weighted
+  risk score, then makes a final approve / reject / refer decision.
+  50 synthetic applications across easy / medium / hard difficulty tiers.
+  Baseline accuracy: 96% (48/50), avg grade score: 0.759.
 
-# HF Spaces hardware (free tier is sufficient for development)
-hardware: cpu-basic   # cpu-basic (free) | cpu-upgrade | t4-small | a10g-small
+# HF Spaces hardware
+hardware: cpu-basic
 
-# Port must match the CMD in Dockerfile
+# Port must match Dockerfile CMD
 port: 7860
 
-# Environment variables injected into the container at runtime
+# Runtime environment variables (set in HF Space Settings → Variables)
 env:
-  WORKERS: "2"
   PORT: "7860"
   HOST: "0.0.0.0"
+  WORKERS: "2"
+  # Set these in HF Space secrets — do NOT hardcode here:
+  # API_BASE_URL: "https://router.huggingface.co/v1"
+  # MODEL_NAME: "meta-llama/Llama-3.3-70B-Instruct"
+  # HF_TOKEN: "hf_..."
+  # GROQ_API_KEY: "gsk_..."   # optional free fallback
 
-# Action space documentation (informational — not enforced by OpenEnv)
+# Task tiers
+tasks:
+  easy:
+    count: 10
+    description: "Clear single or dual-factor decisions. Hard floor catches."
+  medium:
+    count: 20
+    description: "Multi-factor analysis. Mixed signals requiring 3+ reveals."
+  hard:
+    count: 20
+    description: "Conflicting signals. Borderline risk scores (0.35–0.65 band)."
+
+# Action space
 actions:
   assess:
-    - assess_revenue
-    - assess_credit_score
-    - assess_dti
-    - assess_collateral
-    - assess_business_age
-    - assess_cash_flow
+    - assess_revenue        # reveals annual_revenue + loan_to_revenue
+    - assess_credit_score   # reveals credit_score (300–850)
+    - assess_dti            # reveals dti (0.0–1.0)
+    - assess_collateral     # reveals collateral_value
+    - assess_business_age   # reveals business_age_years
+    - assess_cash_flow      # reveals cash_flow_volatility
   decide:
     - decide_approve
     - decide_reject
     - decide_refer
 
-# Observation fields visible to the agent
-observation_fields:
-  always_visible:
-    - application_id
-    - task_id
-    - business_name
-    - sector
-    - loan_amount
-  revealable:
-    - annual_revenue
-    - credit_score
-    - dti
-    - collateral_value
-    - business_age_years
-    - cash_flow_volatility
-  derived:
-    - loan_to_revenue   # auto-computed when annual_revenue is revealed
-
-# Reward structure (informational)
+# Reward structure
 rewards:
-  reveal_informative: +0.10
-  reveal_neutral:     +0.05
-  reveal_duplicate:   -0.05
-  invalid_action:     -0.10
-  decide_correct_easy_medium: +1.00
-  decide_correct_hard:        +1.20
-  decide_refer:               +0.30
-  decide_wrong:               -0.50
-  efficiency_bonus_per_saved: +0.05
-  timeout_penalty:            -0.20
+  reveal_informative:   +0.10
+  reveal_neutral:       +0.05
+  reveal_duplicate:     -0.05
+  invalid_action:       -0.10
+  correct_easy_medium:  +1.00
+  correct_hard:         +1.20
+  refer_partial:        +0.30
+  wrong_decision:       -0.50
+  efficiency_per_saved: +0.05
+  timeout:              -0.20
 
-# Task distribution
-tasks:
-  easy:   10   # Clear single-factor decisions
-  medium: 20   # Multi-factor decisions
-  hard:   20   # Conflicting signals, borderline cases
+# Grader weights per tier
+graders:
+  easy:
+    correctness: 0.80
+    efficiency:  0.20
+  medium:
+    correctness: 0.65
+    efficiency:  0.35
+  hard:
+    correctness: 0.50
+    efficiency:  0.50
+
+# Baseline scores (heuristic agent, seed=42, fully reproducible)
+baseline:
+  agent: HeuristicAgent
+  easy_accuracy:   0.90
+  medium_accuracy: 1.00
+  hard_accuracy:   0.95
+  overall_score:   0.759
+  overall_accuracy: 0.96

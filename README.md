@@ -1,42 +1,82 @@
+---
+title: SME Credit Risk RL Environment
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+tags:
+  - openenv
+  - reinforcement-learning
+  - finance
+  - credit-risk
+---
+
 # SME Credit Risk RL Environment
 
-A multi-step reinforcement learning environment for SME loan decisions, built on the [OpenEnv](https://github.com/meta-pytorch/OpenEnv) framework.
+A multi-step reinforcement learning environment for **small business loan underwriting**, built on the [OpenEnv](https://github.com/meta-pytorch/OpenEnv) framework.
 
-An agent evaluates a small business loan application **step by step** — revealing financial factors one at a time, then making a final decision. This is a genuine RL problem, not a classification task.
+An agent assesses loan applications **step by step** — revealing financial factors one at a time, then making a final approve / reject / refer decision. This mirrors how real loan officers work: gather evidence incrementally, decide when confident enough.
 
 ---
 
-## The Core Idea
+## The Task
 
 ```
-reset("easy_01")                    → hidden application loaded
-step("assess_credit_score")         → credit_score = 780  [POSITIVE] +0.10
-step("assess_dti")                  → dti = 0.28          [POSITIVE] +0.10
-step("decide_approve")              → CORRECT ✓            +1.25
+reset("hard_01")                      → hidden application loaded, all factors concealed
+step("assess_credit_score")           → credit_score = 520  [NEGATIVE]  +0.10
+step("assess_dti")                    → dti = 0.25          [POSITIVE]  +0.10
+step("assess_revenue")                → revenue = £2.1M     [POSITIVE]  +0.10
+step("decide_approve")                → CORRECT ✓           +1.35  (hard bonus)
+
+[END] success=true steps=4 score=0.750 rewards=0.10,0.10,0.10,1.35
 ```
 
-At each step the agent chooses to **reveal a factor** or **make a final decision**. Fewer reveals = higher efficiency bonus. Wrong decision = penalty. The episode ends when a decision is made.
+The agent earns rewards for revealing informative factors, and a large terminal reward for the correct decision. Efficiency bonus: **+0.05 per unrevealed factor** at decision time — sharper agents score higher.
 
 ---
 
 ## Action Space
 
-### Assess actions (reveal one hidden factor)
-| Action | Reveals |
-|---|---|
-| `assess_revenue` | `annual_revenue` (GBP) |
-| `assess_credit_score` | `credit_score` (300–850) |
-| `assess_dti` | `dti` (debt-to-income ratio 0–1) |
-| `assess_collateral` | `collateral_value` (GBP) |
-| `assess_business_age` | `business_age_years` |
-| `assess_cash_flow` | `cash_flow_volatility` (0=stable, 1=volatile) |
+### Assess actions — reveal one hidden factor
+| Action | Reveals | Signal weight |
+|---|---|---|
+| `assess_credit_score` | credit_score (300–850) | 0.30 |
+| `assess_dti` | debt-to-income ratio (0–1) | 0.25 |
+| `assess_revenue` | annual_revenue GBP + loan_to_revenue | 0.20 |
+| `assess_business_age` | business_age_years | 0.15 |
+| `assess_collateral` | collateral_value GBP | discount |
+| `assess_cash_flow` | cash_flow_volatility (0=stable) | 0.10 |
 
-### Decision actions (end the episode)
+### Decision actions — end the episode
 | Action | Meaning |
 |---|---|
 | `decide_approve` | Approve the loan |
 | `decide_reject` | Reject the loan |
 | `decide_refer` | Refer to senior underwriter |
+
+---
+
+## Observation Space
+
+| Field | Type | Always visible? |
+|---|---|---|
+| `application_id` | str | ✓ |
+| `task_id` | str (easy/medium/hard) | ✓ |
+| `business_name`, `sector` | str | ✓ |
+| `loan_amount` | float (GBP) | ✓ |
+| `loan_to_revenue` | float | After assess_revenue |
+| `credit_score` | int 300–850 | After assess_credit_score |
+| `dti` | float 0–1 | After assess_dti |
+| `annual_revenue` | float | After assess_revenue |
+| `collateral_value` | float | After assess_collateral |
+| `business_age_years` | float | After assess_business_age |
+| `cash_flow_volatility` | float 0–1 | After assess_cash_flow |
+| `factors_assessed` | list[str] | ✓ |
+| `factors_remaining` | list[str] | ✓ |
+| `step_count`, `max_steps` | int | ✓ |
+| `cumulative_reward` | float | ✓ |
+| `feedback` | str | ✓ |
+| `done`, `reward` | bool, float | ✓ |
 
 ---
 
@@ -47,45 +87,55 @@ At each step the agent chooses to **reveal a factor** or **make a final decision
 | Reveal informative factor (strong signal) | **+0.10** |
 | Reveal neutral factor | **+0.05** |
 | Reveal duplicate factor | **−0.05** |
-| Invalid action / wrong application_id | **−0.10** |
+| Wrong application_id or invalid action | **−0.10** |
 | Correct decision (easy / medium) | **+1.00** |
 | Correct decision (hard) | **+1.20** |
-| Refer decision (partial credit) | **+0.30** |
+| Refer (partial credit) | **+0.30** |
 | Wrong decision | **−0.50** |
-| Efficiency bonus (per unrevealed factor at decision time) | **+0.05 each** |
-| Timeout — no decision in 8 steps | **−0.20** |
+| Efficiency bonus (per unrevealed factor) | **+0.05 each** |
+| Timeout — no decision in max_steps | **−0.20** |
 
-Maximum possible score per episode: **+1.50** (correct hard decision, zero reveals).
+Maximum possible: **+1.50** (correct hard decision, zero reveals).
 
 ---
 
-## Dataset
+## Risk Formula (ground truth)
 
-50 synthetic SME applications generated deterministically (seed=42) by `generate_dataset.py`.
+Applications are scored by a weighted risk formula:
+
+```
+credit_penalty = (850 - credit_score) / 550          # weight 0.30
+dti_penalty    = piecewise(dti)                       # weight 0.25
+ltr_penalty    = piecewise(loan / revenue)            # weight 0.20
+age_penalty    = piecewise(business_age_years)        # weight 0.15
+vol_penalty    = cash_flow_volatility * 1.2           # weight 0.10
+
+raw_risk  = weighted_sum_of_penalties
+collateral_discount = 1 - 0.20 * min(collateral / loan, 2.0)
+risk_score = raw_risk * collateral_discount
+
+APPROVE  if risk_score < 0.35
+REJECT   if risk_score > 0.65   (or hard floors: credit<500, dti>0.80)
+REFER    otherwise
+```
+
+---
+
+## Task Tiers
 
 | Tier | Count | Description |
 |---|---|---|
-| **Easy** | 10 | One dominant factor drives the decision |
-| **Medium** | 20 | Multi-factor — need 3+ reveals to decide well |
-| **Hard** | 20 | Conflicting signals — designed so agents struggle without all factors |
+| **easy** | 10 | Clear single or dual-factor decisions |
+| **medium** | 20 | Multi-factor analysis required |
+| **hard** | 20 | Conflicting signals — borderline applications |
 
-Ground truth computed by a weighted risk formula (no LLM involved):
-
-```
-risk_score = credit_penalty×0.30 + dti_penalty×0.25 + ltr_penalty×0.20
-           + age_penalty×0.15 + volatility_penalty×0.10
-           × (1 − 0.20 × collateral_coverage)
-
-approve  if risk_score < 0.35
-reject   if risk_score > 0.65  (or hard floors: credit < 500, dti > 0.80)
-refer    otherwise
-```
+50 synthetic SME applications, generated deterministically (seed=42).
 
 ---
 
 ## Grading
 
-Three graders (`env/graders.py`) evaluate completed episodes on a **[0, 1]** scale:
+Three deterministic graders (`env/graders.py`) score completed episodes on **[0.0, 1.0]**:
 
 | Tier | Correctness weight | Efficiency weight |
 |---|---|---|
@@ -93,7 +143,20 @@ Three graders (`env/graders.py`) evaluate completed episodes on a **[0, 1]** sca
 | medium | 65% | 35% |
 | hard | 50% | 50% |
 
-Efficiency score = `1 − (reveals / 6)`. A wrong decision after revealing all 6 factors on hard gets an extra −0.10 surcharge.
+`efficiency = 1 − (n_reveals / 6)`. Hard tier penalises wrong decisions after revealing all 6 factors.
+
+---
+
+## Baseline Scores
+
+Heuristic agent (deterministic, no API key needed):
+
+| Tier | Accuracy | Avg Score | Avg Reveals |
+|---|---|---|---|
+| Easy | 9/10 (90%) | 0.845 | 3.2 |
+| Medium | 20/20 (100%) | 0.807 | 3.3 |
+| Hard | 19/20 (95%) | 0.667 | 3.7 |
+| **Overall** | **48/50 (96%)** | **0.759** | **3.3** |
 
 ---
 
@@ -101,22 +164,21 @@ Efficiency score = `1 − (reveals / 6)`. A wrong decision after revealing all 6
 
 ```
 sme-credit-env/
-├── models.py              ← Type-safe dataclasses (LoanAction, LoanObservation, LoanState)
-├── generate_dataset.py    ← Synthetic dataset generator
-├── tasks.json             ← 50 pre-generated applications
-├── inference.py           ← LLM + heuristic agent, CLI evaluation runner
-├── requirements.txt
+├── inference.py           ← baseline agent + [START][STEP][END] logs
+├── models.py              ← LoanAction, LoanObservation, LoanState dataclasses
+├── tasks.json             ← 50 pre-generated applications (root copy)
+├── openenv.yaml           ← OpenEnv metadata manifest
 ├── Dockerfile
-├── openenv.yaml
-│
+├── requirements.txt
+├── README.md
+├── data/
+│   ├── generate_dataset.py   ← reproducible dataset generator (seed=42)
+│   └── tasks.json            ← primary data location
 ├── env/
-│   ├── __init__.py
-│   ├── environment.py     ← Core RL loop (LoanEnvironment)
-│   └── graders.py         ← Deterministic scoring functions
-│
+│   ├── environment.py     ← LoanEnvironment: reset() / step() / state
+│   └── graders.py         ← grade_easy() / grade_medium() / grade_hard()
 └── server/
-    ├── __init__.py
-    └── app.py             ← FastAPI server
+    └── app.py             ← FastAPI server (OpenEnv HTTP endpoints)
 ```
 
 ---
@@ -129,36 +191,48 @@ sme-credit-env/
 pip install -r requirements.txt
 ```
 
-### 2. Run the heuristic agent locally
+### 2. Run heuristic baseline (no API key needed)
 
 ```bash
-python inference.py                   # one easy episode
-python inference.py --tier hard       # one hard episode
-python inference.py --eval            # all 10 easy tasks
-python inference.py --eval --all      # all 50 tasks
+python inference.py --eval --all
 ```
 
-### 3. Run the LLM agent
+Output:
+```
+[START] task=easy_01 env=sme-credit-env model=...
+[STEP] step=1 action=assess_credit_score reward=0.10 done=false error=null
+[STEP] step=4 action=decide_approve reward=1.15 done=true error=null
+[END] success=true steps=4 score=0.900 rewards=0.10,0.10,0.10,1.15
+```
+
+### 3. Run LLM agent
+
+Set environment variables in `.env`:
+
+```dotenv
+API_BASE_URL=https://router.huggingface.co/v1
+MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct
+HF_TOKEN=hf_your_token_here
+GROQ_API_KEY=gsk_your_groq_key   # optional: free fallback if HF credits run out
+```
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-python inference.py --llm --tier medium
 python inference.py --llm --eval --all
 ```
 
 ### 4. Start the server
 
 ```bash
-uvicorn server.app:app --host 0.0.0.0 --port 7860 --reload
+uvicorn server.app:app --host 0.0.0.0 --port 7860
 ```
 
-### 5. Call the server
+### 5. API endpoints
 
 ```bash
-# List all tasks
-curl http://localhost:7860/tasks
+# Health check
+curl http://localhost:7860/health
 
-# Start an episode
+# Start episode
 curl -X POST http://localhost:7860/reset \
   -H "Content-Type: application/json" \
   -d '{"task_id": "hard_01"}'
@@ -168,31 +242,38 @@ curl -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
   -d '{"action_type": "assess_credit_score", "application_id": "hard_01"}'
 
-# Make a decision
+# Make decision
 curl -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
   -d '{"action_type": "decide_approve", "application_id": "hard_01"}'
 
-# Get full state (includes ground truth)
+# Full internal state (includes ground truth)
 curl http://localhost:7860/state
 
-# Grade an episode
+# Grade a completed episode
 curl -X POST http://localhost:7860/grade \
   -H "Content-Type: application/json" \
   -d '{"action_log": [...], "ground_truth": "approve", "task_id": "hard"}'
+
+# List all 50 tasks
+curl http://localhost:7860/tasks
 ```
 
 ### 6. Docker
 
 ```bash
 docker build -t sme-credit-env:latest .
-docker run -d -p 7860:7860 sme-credit-env:latest
+docker run -d -p 7860:7860 \
+  -e API_BASE_URL=https://router.huggingface.co/v1 \
+  -e MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct \
+  -e HF_TOKEN=hf_your_token \
+  sme-credit-env:latest
 ```
 
-### 7. Deploy to HF Spaces
+### 7. Run against server
 
 ```bash
-openenv push --repo-id YOUR_USERNAME/sme-credit-env
+python inference.py --mode remote --url http://localhost:7860 --eval --all
 ```
 
 ---
@@ -208,7 +289,6 @@ env = LoanEnvironment()
 obs = env.reset("hard_04")
 
 while not obs.done:
-    # your policy here
     action = LoanAction(
         action_type="assess_credit_score",
         application_id=obs.application_id,
@@ -222,67 +302,24 @@ print(f"Score: {score:.3f}")
 
 ---
 
-## Run the Agent Against the Server
+## Environment Variables
 
-```bash
-# Start server in one terminal
-uvicorn server.app:app --port 7860
-
-# Run agent against it in another
-python inference.py --mode remote --eval --all
-```
-
----
-
-## Sample Episode Trace
-
-```
-============================================================
-  Episode: hard_04  [HARD]
-  Business: Ironbridge Technologies Ltd  |  Sector: technology
-  Loan: ₹200,000
-============================================================
-
-  Step 1: assess_credit_score
-  → Reward: +0.100  | Revealed credit_score = 690 [POSITIVE]
-
-  Step 2: assess_collateral
-  → Reward: +0.100  | Revealed collateral_value = ₹550,000 [POSITIVE]
-
-  Step 3: assess_dti
-  → Reward: +0.100  | Revealed dti = 0.300 [POSITIVE]
-
-  Step 4: decide_approve
-  → Reward: +1.350  | Decision: APPROVE. CORRECT ✓
-
-  ──────────────────────────────────────────────────────
-  Decision: APPROVE     Ground truth: APPROVE
-  Outcome:  ✓ CORRECT
-  Reward:   1.4000   Grade score: 0.8333
-  Reveals:  3 / 6   Steps: 4
-```
+| Variable | Required | Description |
+|---|---|---|
+| `API_BASE_URL` | Yes (LLM mode) | LLM API endpoint |
+| `MODEL_NAME` | Yes (LLM mode) | Model identifier |
+| `HF_TOKEN` | Yes (LLM mode) | Hugging Face / API key |
+| `GROQ_API_KEY` | No | Auto-fallback when HF credits exhausted |
+| `PORT` | No (default 7860) | Server port |
+| `WORKERS` | No (default 2) | Uvicorn worker processes |
 
 ---
 
-## Architecture
+## Design Notes
 
-```
-┌─────────────────────────────────────────────────────┐
-│  AGENT (inference.py)                               │
-│  HeuristicAgent | LLMAgent (Claude)                 │
-└─────────────────────┬───────────────────────────────┘
-                      │  reset / step / grade
-          ┌───────────┴──────────┐
-          │  local               │  remote HTTP
-          ▼                      ▼
-┌──────────────────┐   ┌──────────────────────────────┐
-│  LoanEnvironment │   │  FastAPI Server (server/app)  │
-│  (env/)          │   │  → wraps LoanEnvironment      │
-└──────────────────┘   └──────────────────────────────┘
-          │
-          ▼
-┌──────────────────┐
-│  tasks.json      │  50 synthetic SME applications
-│  (ground truth)  │  easy / medium / hard
-└──────────────────┘
-```
+**Why SME lending?** Small business credit decisions are genuinely hard — they involve noisy, correlated signals, hard floors, and borderline cases where a wrong call costs real money. It's a natural fit for multi-step RL: the agent must decide *which* information to gather and *when* it has enough to decide, balancing thoroughness against efficiency.
+
+**Why multi-step?** A single-shot classifier would memorise the formula. By hiding factors and charging efficiency bonuses, we create an information-gathering RL problem where the agent must learn *sequential decision-making under uncertainty*, not just pattern matching.
+
+**Why three tiers?** Easy cases test whether the agent catches hard floors and clear signals. Medium cases require combining 3+ factors. Hard cases have intentionally conflicting signals (e.g., excellent collateral but poor credit) that land in the 0.35–0.65 borderline zone — these are where frontier models genuinely struggle.
+
