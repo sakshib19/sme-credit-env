@@ -13,4 +13,4 @@ pandas==2.3.3
 httpx==0.28.1
 requests==2.33.0
 
-openenv-core==0.2.3
+openenv-core>=0.2.3

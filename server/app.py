@@ -65,7 +65,7 @@ from env.graders import grade
 # and hackathon judges running the code without the full framework.
 # ---------------------------------------------------------------------------
 try:
-    from openenv import create_fastapi_app as _create
+    from openenv.core.env_server import create_fastapi_app as _create
     app = _create(LoanEnvironment)
     _OPENENV_WIRED = True
     print("✅ OpenEnv wired successfully")
