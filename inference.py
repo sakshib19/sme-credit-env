@@ -50,10 +50,12 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Mandatory env vars — READ AFTER load_dotenv()
+# Checklist requirement: defaults ONLY for API_BASE_URL and MODEL_NAME.
+# HF_TOKEN must have NO default value (checklist item 3).
 # ---------------------------------------------------------------------------
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1").strip().strip('"').strip("'")
-MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct").strip().strip('"').strip("'")
-API_KEY      = (os.environ.get("HF_TOKEN") or os.environ.get("API_KEY") or "").strip().strip('"').strip("'")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN")
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible client (MANDATORY for hackathon)
@@ -336,7 +338,7 @@ def _call_llm(prompt: str) -> dict:
     # ── Try primary endpoint ──────────────────────────────────────────
     if not _primary_failed_402:
         try:
-            return _call_with_client(API_BASE_URL, API_KEY, MODEL_NAME, prompt)
+            return _call_with_client(API_BASE_URL, HF_TOKEN or "", MODEL_NAME, prompt)
         except Exception as exc:
             exc_str = str(exc)
             if "402" in exc_str:
@@ -705,11 +707,11 @@ def main():
     args = parser.parse_args()
 
     if args.llm:
-        if not API_KEY:
+        if not HF_TOKEN:
             print("ERROR: HF_TOKEN not set. Add to .env: HF_TOKEN=hf_your_token", flush=True)
             print("Continuing with heuristic fallback.", flush=True)
         else:
-            print(f"  HF_TOKEN loaded ✓ (first 8 chars: {API_KEY[:8]}...)", flush=True)
+            print(f"  HF_TOKEN loaded ✓ (first 8 chars: {HF_TOKEN[:8]}...)", flush=True)
         agent = LLMAgent()
         print(f"Agent: LLM  model={MODEL_NAME}  base={API_BASE_URL}", flush=True)
     else:
