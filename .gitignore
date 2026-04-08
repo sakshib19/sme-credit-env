@@ -8,7 +8,7 @@ __pycache__
 # Virtual environments
 .venv/
 venv/
-env/
+#env/
 ENV/
 
 # Packaging and build artifacts
