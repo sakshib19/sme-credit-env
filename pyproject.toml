@@ -1,0 +1,14 @@
+[project]
+name = "sme-credit-env"
+version = "1.0.0"
+description = "SME Credit Risk RL Environment"
+
+dependencies = [
+    "openenv-core>=0.2.0"
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.openenv]
+entrypoint = "server.app:app"
