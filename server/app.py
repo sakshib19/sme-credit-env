@@ -65,17 +65,16 @@ from env.graders import grade
 # and hackathon judges running the code without the full framework.
 # ---------------------------------------------------------------------------
 try:
-    from openenv.core.env_server import create_fastapi_app as _create
+    from openenv import create_fastapi_app as _create
     app = _create(LoanEnvironment)
     _OPENENV_WIRED = True
-except Exception:
+    print("✅ OpenEnv wired successfully")
+except Exception as e:
+    print("❌ OpenEnv wiring failed:", e)
+
     app = FastAPI(
         title="SME Credit Risk RL Environment",
-        description=(
-            "An RL environment for multi-step SME loan decisions. "
-            "The agent reveals financial factors one at a time then makes a "
-            "final approve / reject / refer decision."
-        ),
+        description="Fallback FastAPI (OpenEnv not wired)",
         version="1.0.0",
     )
     _OPENENV_WIRED = False
