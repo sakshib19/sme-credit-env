@@ -66,9 +66,16 @@ from env.graders import grade
 # ---------------------------------------------------------------------------
 try:
     from openenv.core.env_server import create_fastapi_app as _create
-    app = _create(LoanEnvironment)
+
+    app = _create(
+        LoanEnvironment,
+        action_cls=LoanAction,
+        observation_cls=LoanObservation,
+    )
+
     _OPENENV_WIRED = True
     print("✅ OpenEnv wired successfully")
+
 except Exception as e:
     print("❌ OpenEnv wiring failed:", e)
 
