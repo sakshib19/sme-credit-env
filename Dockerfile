@@ -39,12 +39,12 @@ RUN pip install --no-cache-dir -r requirements.txt
  
 # Copy all project files
 COPY models.py          ./models.py
-COPY tasks.json         ./tasks.json
 COPY inference.py       ./inference.py
 COPY openenv.yaml       ./openenv.yaml
 COPY env/               ./env/
 COPY server/            ./server/
 COPY data/              ./data/
+COPY README.md ./README.md
  
 # Expose HF Spaces port
 EXPOSE 7860
