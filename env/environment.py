@@ -33,6 +33,7 @@ import json
 import uuid
 from pathlib import Path
 from typing import Optional
+from dataclasses import asdict
 
 # ---------------------------------------------------------------------------
 # Resolve tasks.json — checked in priority order
@@ -239,7 +240,7 @@ class LoanEnvironment:
     # Public interface
     # ------------------------------------------------------------------
 
-    def reset(self, task_id: str) -> LoanObservation:
+    def reset(self, task_id: str) -> dict:
         """
         Start a new episode.
 
@@ -273,92 +274,42 @@ class LoanEnvironment:
         self._risk_score        = app.get("risk_score", 0.0)
         self._factor_directions = _compute_factor_directions(app)
 
-        return self._make_obs(
+        return asdict(self._make_obs(
             reward=0.0,
-            feedback="Episode started. All factors hidden. Assess before deciding.",
+            feedback="Episode started...",
             valid=True,
-        )
+        ))
 
-    def step(self, action: LoanAction) -> LoanObservation:
-        """
-        Execute one agent action.
 
-        Parameters
-        ----------
-        action : LoanAction
-            action_type must be in VALID_ACTIONS.
-            application_id must match current episode.
-
-        Returns
-        -------
-        Updated LoanObservation with step reward and feedback.
-        """
+    def step(self, action: LoanAction) -> dict:
         if self._done:
-            return self._make_obs(
-                reward=0.0,
-                feedback="Episode already done. Call reset() to start a new episode.",
-                valid=False,
-            )
+            return asdict(self._make_obs(0.0, "Episode already done.", False))
 
-        # ── Validate application_id ──────────────────────────────────
         if action.application_id != self._application_id:
             r = _R_INVALID_ACTION
             self._apply_reward(r)
-            self._penalty_total += abs(r)
-            self._log(action, r, valid=False)
-            return self._make_obs(
-                reward=r,
-                feedback=(
-                    f"Wrong application_id '{action.application_id}'. "
-                    f"Expected '{self._application_id}'. Penalty: {r}."
-                ),
-                valid=False,
-            )
+            return asdict(self._make_obs(r, "Wrong application_id", False))
 
-        # ── Validate action_type ─────────────────────────────────────
         if action.action_type not in VALID_ACTIONS:
             r = _R_INVALID_ACTION
             self._apply_reward(r)
-            self._penalty_total += abs(r)
-            self._log(action, r, valid=False)
-            return self._make_obs(
-                reward=r,
-                feedback=(
-                    f"Unknown action_type '{action.action_type}'. "
-                    f"Valid: {sorted(VALID_ACTIONS)}. Penalty: {r}."
-                ),
-                valid=False,
-            )
+            return asdict(self._make_obs(r, "Invalid action", False))
 
         self._step_count += 1
 
-        # ── Dispatch ─────────────────────────────────────────────────
         if action.action_type in ASSESS_ACTIONS:
             obs = self._handle_assess(action)
         else:
             obs = self._handle_decide(action)
 
-        # ── Auto-timeout ─────────────────────────────────────────────
         if not self._done and self._step_count >= _MAX_STEPS:
             r = _R_TIMEOUT_PENALTY
             self._apply_reward(r)
-            self._penalty_total += abs(r)
             self._done = True
-            timeout_action = LoanAction(
-                action_type="__timeout__",
-                application_id=self._application_id,
-            )
-            self._log(timeout_action, r, valid=False)
-            return self._make_obs(
-                reward=r,
-                feedback=(
-                    f"Step budget ({_MAX_STEPS}) reached without a decision. "
-                    f"Episode ended. Penalty: {r}."
-                ),
-                valid=False,
-            )
+            return asdict(self._make_obs(r, "Timeout", False))
 
-        return obs
+        return asdict(obs)
+
 
     @property
     def state(self) -> LoanState:
