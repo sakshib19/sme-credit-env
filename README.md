@@ -322,4 +322,3 @@ print(f"Score: {score:.3f}")
 **Why multi-step?** A single-shot classifier would memorise the formula. By hiding factors and charging efficiency bonuses, we create an information-gathering RL problem where the agent must learn *sequential decision-making under uncertainty*, not just pattern matching.
 
 **Why three tiers?** Easy cases test whether the agent catches hard floors and clear signals. Medium cases require combining 3+ factors. Hard cases have intentionally conflicting signals (e.g., excellent collateral but poor credit) that land in the 0.35–0.65 borderline zone — these are where frontier models genuinely struggle.
-
