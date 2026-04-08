@@ -62,7 +62,7 @@ openapi-pydantic==0.5.1
 openenv-core==0.2.3
 opentelemetry-api==1.40.0
 orjson==3.11.7
-packaging @ file:///C:/miniconda3/conda-bld/packaging_1761049101700/work
+packaging==23.2
 pandas==2.3.3
 pathable==0.5.0
 pillow==12.1.1
