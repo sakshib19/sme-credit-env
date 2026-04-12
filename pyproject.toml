@@ -1,14 +1,55 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# pyproject.toml — SME Credit Risk RL Environment
+# ================================================
+# Used by: uv sync (Dockerfile build), uv lock (regenerating uv.lock)
+#
+# CRITICAL: openenv-core[core] (not bare openenv-core) is required.
+# The [core] extra installs the env_server package including:
+#   - openenv.core.env_server.http_server.create_app()
+#   - openenv.core.env_server.Environment base class
+#   - openenv.core.env_server.types Action/Observation/State
+# Without [core], server/app.py fails on import at startup.
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sme-credit-env"
 version = "1.0.0"
-description = "SME Credit Risk RL Environment"
+description = "SME Credit Risk RL Environment for OpenEnv Hackathon"
+requires-python = ">=3.10"
 
 dependencies = [
-    "openenv-core>=0.2.0"
+    # Core OpenEnv runtime — [core] extra is MANDATORY for create_app()
+    "openenv-core[core]>=0.2.2",
+    # Web server
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.24.0",
+    # LLM client (inference.py)
+    "openai>=1.0.0",
+    # Env loading (inference.py)
+    "python-dotenv>=1.0.0",
+    # Data / validation
+    "pydantic>=2.0.0",
+    "requests>=2.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
 ]
 
 [project.scripts]
+# Enables: uv run server  OR  python -m server.app
 server = "server.app:main"
 
 [tool.openenv]
+# openenv validate reads this to know the FastAPI app object
 entrypoint = "server.app:app"
+
+[tool.setuptools]
+include-package-data = true
+# Declare Python packages so uv/setuptools can find them
+packages = ["server", "tasks"]

@@ -11,23 +11,11 @@ Log format (strictly followed — auto-evaluated by judges):
   [START] task=<id> env=sme-credit-env model=<model>
   [STEP]  step=<n> action=<action_type> reward=<R.RR> done=<true|false> error=<msg|null>
   [END]   success=<true|false> steps=<n> score=<S.SSS> rewards=<r1,r2,...>
-
-Modes:
-  local   — directly calls LoanEnvironment (no server needed)
-  remote  — calls FastAPI server via HTTP
-
-Usage:
-  python inference.py                        # heuristic, local, all tiers
-  python inference.py --eval --all           # full evaluation
-  python inference.py --llm --eval --all     # LLM agent, full evaluation
-  python inference.py --task hard_01 --verbose
-  python inference.py --mode remote --eval --all --url http://localhost:7860
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import os
 import sys
@@ -49,26 +37,32 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# Mandatory env vars — READ AFTER load_dotenv()
-# Checklist requirement: defaults ONLY for API_BASE_URL and MODEL_NAME.
-# HF_TOKEN must have NO default value (checklist item 3).
+# Mandatory env vars
+# Checklist: defaults ONLY for API_BASE_URL and MODEL_NAME. HF_TOKEN = no default.
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.3-70B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN")
+HF_TOKEN     = os.getenv("HF_TOKEN")   # NO default — checklist item 3
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible client (MANDATORY for hackathon)
+# OpenAI-compatible client (MANDATORY)
 # ---------------------------------------------------------------------------
 from openai import OpenAI as _OpenAIClient
 
 # ---------------------------------------------------------------------------
-# Path bootstrap
+# Path bootstrap — ensures local packages resolve from any cwd
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# ---------------------------------------------------------------------------
+# Local imports
+# NOTE: inference.py imports from tasks.environment (the plain class),
+# NOT from server.loan_environment (the openenv-base class).
+# This is correct — inference.py uses the env directly or via HTTP,
+# it does NOT need the openenv Environment base class.
+# ---------------------------------------------------------------------------
 from models import (
     LoanAction,
     LoanObservation,
@@ -76,16 +70,12 @@ from models import (
     ACTION_TO_FACTOR,
     REVEALABLE_FACTORS,
 )
-from env.environment import LoanEnvironment, _load_tasks
-from env.graders import grade
+from tasks.environment import LoanEnvironment, _load_tasks
+from tasks.graders import grade
 
 
 # ---------------------------------------------------------------------------
-# Structured logging — MANDATORY FORMAT (auto-evaluated by judges)
-#
-# [START] task=<id> env=sme-credit-env model=<model>
-# [STEP]  step=<n> action=<action_type> reward=<R.RR> done=<true|false> error=<msg|null>
-# [END]   success=<true|false> steps=<n> score=<S.SSS> rewards=<r1,r2,...>
+# Structured logging — MANDATORY FORMAT
 # ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -95,20 +85,14 @@ def log_start(task: str, env: str, model: str) -> None:
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_val = error if error else "null"
     done_val  = str(done).lower()
-    print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} "
-        f"done={done_val} error={error_val}",
-        flush=True,
-    )
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} "
+          f"done={done_val} error={error_val}", flush=True)
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
-        flush=True,
-    )
+    print(f"[END] success={str(success).lower()} steps={steps} "
+          f"score={score:.3f} rewards={rewards_str}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -147,17 +131,15 @@ Decide (ends episode):
 
   RISK < 0.35  → decide_approve
   RISK > 0.65  → decide_reject
-  RISK 0.35–0.65 → decide_refer   ← multiple negatives does NOT mean reject
+  RISK 0.35–0.65 → decide_refer
 
 ━━━ MANDATORY: FOLLOW THE COMPUTED RISK NUMBER ━━━━━━━━━━━━━━━━
-The prompt shows you a pre-computed partial_risk. TRUST IT.
   partial_risk < 0.35  → MUST say decide_approve
   partial_risk 0.35–0.65 → MUST say decide_refer  (NOT reject)
   partial_risk > 0.65  → MUST say decide_reject
 
 ━━━ EFFICIENCY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  +0.05 bonus per unrevealed factor at decision time.
-  Reveal 3–4 factors, then decide. Only reveal all 6 for borderline cases.
+  +0.05 bonus per unrevealed factor at decision time. Reveal 3–4 factors.
 
 ━━━ RESPONSE FORMAT (strict JSON, no markdown, no prose) ━━━━━━
 {"reasoning": "risk≈X.XX in BAND because ...", "action_type": "decide_refer"}
@@ -165,7 +147,7 @@ The prompt shows you a pre-computed partial_risk. TRUST IT.
 
 
 # ---------------------------------------------------------------------------
-# Risk computation helpers (mirrors generate_dataset.py exactly)
+# Risk computation helpers
 # ---------------------------------------------------------------------------
 
 def _credit_p(s: float) -> float:
@@ -192,24 +174,21 @@ def _age_p(a: float) -> float:
     return 0.90
 
 def _compute_risk_for_prompt(obs: LoanObservation) -> str:
-    """Pre-compute risk from revealed factors; show breakdown in prompt."""
     UNKNOWN = 0.5
-    cp  = _credit_p(obs.credit_score)        if obs.credit_score         is not None else UNKNOWN
-    dp  = _dti_p(obs.dti)                    if obs.dti                  is not None else UNKNOWN
+    cp  = _credit_p(obs.credit_score)  if obs.credit_score  is not None else UNKNOWN
+    dp  = _dti_p(obs.dti)              if obs.dti           is not None else UNKNOWN
     ltr = obs.loan_to_revenue if obs.loan_to_revenue is not None else (
           obs.loan_amount / max(obs.annual_revenue, 1) if obs.annual_revenue else None)
     lp  = _ltr_p(ltr) if ltr is not None else UNKNOWN
-    ap  = _age_p(obs.business_age_years)     if obs.business_age_years   is not None else UNKNOWN
+    ap  = _age_p(obs.business_age_years)    if obs.business_age_years   is not None else UNKNOWN
     vp  = min(1.0, obs.cash_flow_volatility * 1.2) if obs.cash_flow_volatility is not None else UNKNOWN
-    cov = (obs.collateral_value / max(obs.loan_amount, 1)) if obs.collateral_value is not None else 0.0
+    cov  = (obs.collateral_value / max(obs.loan_amount, 1)) if obs.collateral_value is not None else 0.0
     disc = 1.0 - 0.20 * min(cov, 2.0)
-
     raw  = cp*0.30 + dp*0.25 + lp*0.20 + ap*0.15 + vp*0.10
     risk = raw * disc
     n    = len(obs.factors_assessed)
     band = "APPROVE (<0.35)" if risk < 0.35 else "REJECT (>0.65)" if risk > 0.65 else "REFER (0.35-0.65)"
     conf = "LOW" if n <= 2 else "MEDIUM" if n <= 4 else "HIGH"
-
     lines = [
         f"  partial_risk = {risk:.4f}  → band = {band}  [confidence={conf}]",
         f"  breakdown: credit={cp:.3f}×0.30={cp*0.30:.3f} | dti={dp:.3f}×0.25={dp*0.25:.3f} | "
@@ -230,13 +209,12 @@ def _obs_to_prompt(obs: LoanObservation) -> str:
         f"APPLICATION: {obs.application_id}  |  {obs.business_name}  ({obs.sector})",
         f"Loan: £{obs.loan_amount:,.0f}",
         f"Step: {obs.step_count}/{obs.max_steps}  |  Cumulative reward: {obs.cumulative_reward:.3f}",
-        "",
-        "REVEALED FACTORS:",
+        "", "REVEALED FACTORS:",
     ]
     fmt = {
         "annual_revenue":       ("Annual Revenue",       lambda v: f"£{v:,.0f}"),
         "credit_score":         ("Credit Score",         lambda v: str(v)),
-        "dti":                  ("DTI",                  lambda v: f"{v:.1%}  ({'HARD FLOOR' if v > 0.80 else 'high' if v > 0.60 else 'moderate' if v > 0.40 else 'good'})"),
+        "dti":                  ("DTI",                  lambda v: f"{v:.1%}  ({'HARD FLOOR' if v>0.80 else 'high' if v>0.60 else 'moderate' if v>0.40 else 'good'})"),
         "collateral_value":     ("Collateral",           lambda v: f"£{v:,.0f}  (coverage={v/max(obs.loan_amount,1):.2f}x)"),
         "business_age_years":   ("Business Age",         lambda v: f"{v:.1f} yrs"),
         "cash_flow_volatility": ("Cash Flow Volatility", lambda v: f"{v:.2f}  ({'high' if v>0.60 else 'moderate' if v>0.40 else 'low'})"),
@@ -251,23 +229,17 @@ def _obs_to_prompt(obs: LoanObservation) -> str:
         lines.append(f"  {'Loan-to-Revenue':24s}: {obs.loan_to_revenue:.3f}x")
     if not any_revealed:
         lines.append("  (none revealed yet)")
-
-    # Hard floor warnings
     if obs.credit_score is not None and obs.credit_score < 500:
         lines += ["", f"  ⚠ HARD FLOOR: credit_score={obs.credit_score} < 500 → MUST decide_reject"]
     if obs.dti is not None and obs.dti > 0.80:
         lines += ["", f"  ⚠ HARD FLOOR: dti={obs.dti:.2f} > 0.80 → MUST decide_reject"]
-
     lines += [
-        "",
-        "RISK ESTIMATE (computed from revealed factors):",
-        _compute_risk_for_prompt(obs),
-        "",
+        "", "RISK ESTIMATE (computed from revealed factors):",
+        _compute_risk_for_prompt(obs), "",
         f"Factors still hidden: {obs.factors_remaining}",
-        f"Last feedback: {obs.feedback}",
-        "",
+        f"Last feedback: {obs.feedback}", "",
         "━━━ DECISION RULES (based on confidence) ━━━━━━━━━━━━━━━━━━━━━━",
-        f"Confidence is {('LOW' if len(obs.factors_assessed) <= 2 else 'MEDIUM' if len(obs.factors_assessed) <= 4 else 'HIGH')} ({len(obs.factors_assessed)}/6 factors revealed).",
+        f"Confidence is {('LOW' if len(obs.factors_assessed)<=2 else 'MEDIUM' if len(obs.factors_assessed)<=4 else 'HIGH')} ({len(obs.factors_assessed)}/6 factors revealed).",
         "",
         "  confidence=LOW  (≤2 factors): DO NOT decide yet. Reveal more first.",
         "    Exception: ONLY decide_reject if credit_score<500 OR dti>0.80.",
@@ -289,22 +261,16 @@ def _obs_to_prompt(obs: LoanObservation) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM call
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Groq free fallback — used automatically when primary endpoint returns 402
-# Sign up free at groq.com — no card needed, 14,400 req/day
+# Groq free fallback — auto-used when HF returns 402
 # ---------------------------------------------------------------------------
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL    = "llama-3.1-8b-instant"
 GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
 
-_primary_failed_402 = False   # module-level flag: skip primary after first 402
+_primary_failed_402 = False
 
 
 def _call_with_client(base_url: str, api_key: str, model: str, prompt: str) -> dict:
-    """Single LLM call attempt. Returns parsed dict or raises."""
     client = _OpenAIClient(base_url=base_url, api_key=api_key or "no-key")
     resp = client.chat.completions.create(
         model=model,
@@ -324,18 +290,7 @@ def _call_with_client(base_url: str, api_key: str, model: str, prompt: str) -> d
 
 
 def _call_llm(prompt: str) -> dict:
-    """
-    Call the LLM. Automatically falls back to Groq if the primary
-    endpoint returns HTTP 402 (credits exhausted).
-
-    Priority:
-      1. Primary endpoint (API_BASE_URL / MODEL_NAME)
-      2. Groq free tier  (if GROQ_API_KEY set and primary returned 402)
-      3. Heuristic agent (silent fallback)
-    """
     global _primary_failed_402
-
-    # ── Try primary endpoint ──────────────────────────────────────────
     if not _primary_failed_402:
         try:
             return _call_with_client(API_BASE_URL, HF_TOKEN or "", MODEL_NAME, prompt)
@@ -348,49 +303,39 @@ def _call_llm(prompt: str) -> dict:
                     print(f"  [Switching to Groq free tier: {GROQ_MODEL}]", flush=True)
                 else:
                     print("  [No GROQ_API_KEY set — using heuristic fallback]", flush=True)
-                    print("  [Add GROQ_API_KEY=gsk_... to .env for free LLM calls]", flush=True)
             else:
                 print(f"  [LLM error: {exc}] → heuristic fallback", flush=True)
                 return {}
-
-    # ── Try Groq fallback ─────────────────────────────────────────────
     if _primary_failed_402 and GROQ_API_KEY:
         try:
             return _call_with_client(GROQ_BASE_URL, GROQ_API_KEY, GROQ_MODEL, prompt)
         except Exception as exc:
             print(f"  [Groq error: {exc}] → heuristic fallback", flush=True)
-
     return {}
 
 
 # ---------------------------------------------------------------------------
-# Heuristic agent — implements the exact weighted risk formula
+# Heuristic agent
 # ---------------------------------------------------------------------------
 
 class HeuristicAgent:
-    """Deterministic rule-based agent using the exact generate_dataset.py formula."""
-
     REVEAL_PRIORITY = [
-        "assess_credit_score",
-        "assess_dti",
-        "assess_revenue",
-        "assess_business_age",
-        "assess_collateral",
-        "assess_cash_flow",
+        "assess_credit_score", "assess_dti", "assess_revenue",
+        "assess_business_age", "assess_collateral", "assess_cash_flow",
     ]
 
     def _estimate_risk(self, obs: LoanObservation) -> Optional[float]:
         if len(obs.factors_assessed) < 3:
             return None
         UNKNOWN = 0.5
-        cp  = _credit_p(obs.credit_score)        if obs.credit_score         is not None else UNKNOWN
-        dp  = _dti_p(obs.dti)                    if obs.dti                  is not None else UNKNOWN
+        cp  = _credit_p(obs.credit_score)  if obs.credit_score  is not None else UNKNOWN
+        dp  = _dti_p(obs.dti)              if obs.dti           is not None else UNKNOWN
         ltr = obs.loan_to_revenue if obs.loan_to_revenue is not None else (
               obs.loan_amount / max(obs.annual_revenue, 1) if obs.annual_revenue else None)
         lp  = _ltr_p(ltr) if ltr is not None else UNKNOWN
-        ap  = _age_p(obs.business_age_years)     if obs.business_age_years   is not None else UNKNOWN
+        ap  = _age_p(obs.business_age_years)    if obs.business_age_years   is not None else UNKNOWN
         vp  = min(1.0, obs.cash_flow_volatility * 1.2) if obs.cash_flow_volatility is not None else UNKNOWN
-        cov = (obs.collateral_value / max(obs.loan_amount, 1)) if obs.collateral_value is not None else 0.0
+        cov  = (obs.collateral_value / max(obs.loan_amount, 1)) if obs.collateral_value is not None else 0.0
         disc = 1.0 - 0.20 * min(cov, 2.0)
         return round((cp*0.30 + dp*0.25 + lp*0.20 + ap*0.15 + vp*0.10) * disc, 4)
 
@@ -417,8 +362,6 @@ class HeuristicAgent:
 # ---------------------------------------------------------------------------
 
 class LLMAgent:
-    """LLM-driven agent with heuristic fallback."""
-
     def __init__(self):
         self._heuristic = HeuristicAgent()
 
@@ -434,15 +377,22 @@ class LLMAgent:
 
 # ---------------------------------------------------------------------------
 # Deserialise server JSON → LoanObservation
+# FIX: models.py now uses Pydantic (inherits Observation from openenv).
+# Use model_fields (Pydantic v2) instead of dataclasses.fields().
 # ---------------------------------------------------------------------------
 
 def _dict_to_obs(d: dict) -> LoanObservation:
-    valid = {f.name for f in dataclasses.fields(LoanObservation)}
+    """
+    Reconstruct LoanObservation from a server JSON response.
+    LoanObservation is now a Pydantic model (inherits from openenv Observation).
+    Use model_fields for field introspection, not dataclasses.fields().
+    """
+    valid = set(LoanObservation.model_fields.keys())
     return LoanObservation(**{k: v for k, v in d.items() if k in valid})
 
 
 # ---------------------------------------------------------------------------
-# Local episode runner — emits mandatory [START][STEP][END] logs
+# Local episode runner
 # ---------------------------------------------------------------------------
 
 def run_episode_local(
@@ -451,10 +401,9 @@ def run_episode_local(
     agent,
     verbose: bool = False,
 ) -> dict:
-    obs = env.reset(task_id)
+    obs = env.reset(task_id)   # tasks/environment.py reset — positional arg OK
     env_name = "sme-credit-env"
 
-    # ── [START] ──────────────────────────────────────────────────────
     log_start(task=obs.application_id, env=env_name, model=MODEL_NAME)
 
     if verbose:
@@ -467,7 +416,6 @@ def run_episode_local(
     step = 0
 
     while not obs.done:
-        # Choose action
         if isinstance(agent, LLMAgent):
             action_type, reasoning = agent.choose_action(obs)
         else:
@@ -479,54 +427,35 @@ def run_episode_local(
             if reasoning:
                 print(f"  Reasoning: {reasoning}")
 
-        # Step environment
-        prev_done = obs.done
         obs = env.step(LoanAction(
             action_type=action_type,
             application_id=obs.application_id,
         ))
         step += 1
 
-        reward     = obs.reward if obs.reward is not None else 0.0
-        error_str  = None if obs.last_action_valid else obs.feedback[:80]
+        reward    = obs.reward if obs.reward is not None else 0.0
+        error_str = None if obs.last_action_valid else obs.feedback[:80]
         rewards.append(reward)
 
-        # ── [STEP] ───────────────────────────────────────────────────
-        log_step(
-            step=step,
-            action=action_type,
-            reward=reward,
-            done=obs.done,
-            error=error_str,
-        )
+        log_step(step=step, action=action_type, reward=reward, done=obs.done, error=error_str)
 
         if verbose:
             print(f"  → Reward: {reward:+.3f}  |  Cumulative: {obs.cumulative_reward:.3f}")
             if obs.feedback:
                 print(f"  → {obs.feedback}")
 
-    # Grade
     st    = env.state
-    score = grade(
-        action_log=st.action_log,
-        ground_truth=st.ground_truth_decision,
-        task_id=st.task_id,
-    )
+    score = grade(action_log=st.action_log, ground_truth=st.ground_truth_decision, task_id=st.task_id)
     correct = obs.final_decision == st.ground_truth_decision
 
-    # ── [END] ────────────────────────────────────────────────────────
-    log_end(
-        success=correct,
-        steps=step,
-        score=score,
-        rewards=rewards,
-    )
+    log_end(success=correct, steps=step, score=score, rewards=rewards)
 
     if verbose:
         mark = "✓ CORRECT" if correct else "✗ WRONG"
         print(f"\n  {'─'*50}")
         print(f"  Decision: {obs.final_decision.upper():10s}  GT: {st.ground_truth_decision.upper()}")
-        print(f"  {mark}  |  Grade: {score:.4f}  |  Reveals: {sum(1 for e in st.action_log if e['action_type'].startswith('assess_') and e['valid'])}/6")
+        print(f"  {mark}  |  Grade: {score:.4f}  |  Reveals: "
+              f"{sum(1 for e in st.action_log if e['action_type'].startswith('assess_') and e['valid'])}/6")
 
     return {
         "application_id":    obs.application_id,
@@ -620,13 +549,14 @@ def run_episode_remote(
 
 # ---------------------------------------------------------------------------
 # Full evaluation runner
+# FIX: default base_url changed from 7860 to 8000 (matches Dockerfile CMD)
 # ---------------------------------------------------------------------------
 
 def run_evaluation(
     agent,
     mode: str = "local",
     tier: Optional[str] = None,
-    base_url: str = "http://localhost:7860",
+    base_url: str = "http://localhost:8000",   # FIX: was 7860
     verbose: bool = False,
 ) -> dict:
     all_tasks    = _load_tasks()
@@ -692,12 +622,13 @@ def run_evaluation(
 
 # ---------------------------------------------------------------------------
 # CLI
+# FIX: --url default changed from 7860 to 8000 (matches Dockerfile CMD)
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="SME Credit Risk RL Agent")
     parser.add_argument("--mode",    default="local", choices=["local", "remote"])
-    parser.add_argument("--url",     default=os.environ.get("SME_ENV_URL", "http://localhost:7860"))
+    parser.add_argument("--url",     default=os.environ.get("SME_ENV_URL", "http://localhost:8000"))  # FIX
     parser.add_argument("--tier",    default=None, choices=["easy", "medium", "hard"])
     parser.add_argument("--task",    default=None)
     parser.add_argument("--eval",    action="store_true")

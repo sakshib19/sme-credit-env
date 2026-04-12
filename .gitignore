@@ -8,7 +8,7 @@ __pycache__
 # Virtual environments
 .venv/
 venv/
-#env/
+env/
 ENV/
 
 # Packaging and build artifacts
@@ -51,3 +51,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+env/__pycache__/environment.cpython-310.pyc

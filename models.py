@@ -1,43 +1,44 @@
 """
-models.py — SME Credit Risk Assessment Environment
-====================================================
-Type-safe contracts for the OpenEnv interface.
+models.py — SME Credit Risk RL — typed models
+==============================================
+CRITICAL: LoanAction, LoanObservation, LoanState MUST inherit from
+openenv.core.env_server.types Action/Observation/State.
 
-Architecture
-------------
-The real openenv-core package ships Observation and Action as Pydantic v2
-BaseModel subclasses, and State as a plain dataclass.  Inheriting from
-a Pydantic model using @dataclass is not supported in Pydantic v2 — it
-raises AttributeError: '__pydantic_extra__' at runtime.
+create_app() calls:
+  isinstance(env_instance, Environment)      ← needs Environment base
+  action_cls.__fields__                      ← needs Pydantic (from openenv types)
+  observation_cls.model_validate(payload)    ← needs Pydantic .model_validate()
 
-Solution used here:
-  • LoanAction      → plain @dataclass  (standalone, no inheritance)
-  • LoanObservation → plain @dataclass  (standalone, no inheritance)
-  • LoanState       → plain @dataclass  (standalone, no inheritance)
-
-app.py passes these classes to create_fastapi_app() which handles
-the OpenEnv registration.  The environment itself just needs the
-three dataclasses to carry the right fields — it does not need to
-inherit from openenv base classes at all.
+Plain @dataclass has none of these → TypeError on startup.
+The openenv base types are Pydantic v2 models. All our fields just work.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, List, Optional
+from openenv.core.env_server.types import Action, Observation, State
 
 
 # ---------------------------------------------------------------------------
-# Constants — action strings
+# Constants — unchanged from original
 # ---------------------------------------------------------------------------
+
+REVEALABLE_FACTORS = [
+    "credit_score",
+    "dti",
+    "annual_revenue",
+    "collateral_value",
+    "business_age_years",
+    "cash_flow_volatility",
+]
 
 ASSESS_ACTIONS = {
-    "assess_revenue",        # reveals annual_revenue
-    "assess_credit_score",   # reveals credit_score
-    "assess_dti",            # reveals dti
-    "assess_collateral",     # reveals collateral_value
-    "assess_business_age",   # reveals business_age_years
-    "assess_cash_flow",      # reveals cash_flow_volatility
+    "assess_credit_score",
+    "assess_dti",
+    "assess_revenue",
+    "assess_collateral",
+    "assess_business_age",
+    "assess_cash_flow",
 }
 
 DECIDE_ACTIONS = {
@@ -48,187 +49,84 @@ DECIDE_ACTIONS = {
 
 VALID_ACTIONS = ASSESS_ACTIONS | DECIDE_ACTIONS
 
-REVEALABLE_FACTORS = [
-    "annual_revenue",
-    "credit_score",
-    "dti",
-    "collateral_value",
-    "business_age_years",
-    "cash_flow_volatility",
-]
-
-ACTION_TO_FACTOR: dict[str, str] = {
-    "assess_revenue":      "annual_revenue",
-    "assess_credit_score": "credit_score",
-    "assess_dti":          "dti",
-    "assess_collateral":   "collateral_value",
-    "assess_business_age": "business_age_years",
-    "assess_cash_flow":    "cash_flow_volatility",
+ACTION_TO_FACTOR: Dict[str, str] = {
+    "assess_credit_score":   "credit_score",
+    "assess_dti":            "dti",
+    "assess_revenue":        "annual_revenue",
+    "assess_collateral":     "collateral_value",
+    "assess_business_age":   "business_age_years",
+    "assess_cash_flow":      "cash_flow_volatility",
 }
 
 
 # ---------------------------------------------------------------------------
-# LoanAction — what the agent sends
+# Models — inherit from openenv types (Pydantic v2 under the hood)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class LoanAction:
+class LoanAction(Action):
     """
-    One agent action per step.
-
-    action_type : str
-        One of VALID_ACTIONS.
-        assess_*  → reveal a hidden financial factor.
-        decide_*  → make the final approve / reject / refer decision.
-
-    application_id : str
-        Must match the application_id in the current observation.
-        A mismatch triggers a penalty in environment.step().
+    Action sent by the agent.
+    Inherits Action (Pydantic BaseModel) — create_app() uses .model_dump()
+    and field introspection on this class.
     """
-    action_type:    str = "assess_revenue"
-    application_id: str = ""
+    action_type:    str   # e.g. "assess_credit_score" or "decide_approve"
+    application_id: str   # must match current episode's application_id
 
 
-# ---------------------------------------------------------------------------
-# LoanObservation — what the agent receives back
-# ---------------------------------------------------------------------------
-
-@dataclass
-class LoanObservation:
+class LoanObservation(Observation):
     """
-    Agent's view after each step.
+    Observation returned by reset() and step().
+    Inherits Observation (Pydantic BaseModel) — create_app() uses
+    .model_validate() to deserialise from JSON and .model_dump() to serialise.
 
-    Base fields (match OpenEnv Observation contract)
-    -------------------------------------------------
-    done     : bool         — True when the episode is complete.
-    reward   : float | None — Step reward earned.
-    metadata : dict         — Reserved for framework use.
-
-    Always visible
-    --------------
-    application_id, task_id, business_name, sector, loan_amount,
-    loan_to_revenue (auto-computed once annual_revenue is known)
-
-    Revealable factors (None = hidden until the agent calls assess_*)
-    -----------------------------------------------------------------
-    annual_revenue, credit_score, dti, collateral_value,
-    business_age_years, cash_flow_volatility
-
-    Progress / feedback
-    -------------------
-    factors_assessed, factors_remaining, step_count, max_steps,
-    cumulative_reward, last_action_valid, feedback, final_decision
+    All fields must have defaults so that empty construction is possible
+    (create_app() may construct an empty observation for schema generation).
     """
+    done:                bool           = False
+    reward:              float          = 0.0
+    metadata:            Dict[str, Any] = {}
 
-    # OpenEnv base contract fields
-    done:     bool          = False
-    reward:   Optional[float] = None
-    metadata: dict          = field(default_factory=dict)
+    application_id:      str            = ""
+    task_id:             str            = ""
+    business_name:       str            = ""
+    sector:              str            = ""
+    loan_amount:         float          = 0.0
 
-    # Always visible
-    application_id: str   = ""
-    task_id:        str   = "easy"
-    business_name:  str   = ""
-    sector:         str   = ""
-    loan_amount:    float = 0.0
-    loan_to_revenue: Optional[float] = None
-
-    # Revealable factors (None = hidden)
-    annual_revenue:       Optional[float] = None
-    credit_score:         Optional[int]   = None
-    dti:                  Optional[float] = None
-    collateral_value:     Optional[float] = None
-    business_age_years:   Optional[float] = None
+    # Financial factors — None means not yet revealed
+    loan_to_revenue:     Optional[float] = None
+    annual_revenue:      Optional[float] = None
+    credit_score:        Optional[int]   = None
+    dti:                 Optional[float] = None
+    collateral_value:    Optional[float] = None
+    business_age_years:  Optional[float] = None
     cash_flow_volatility: Optional[float] = None
 
-    # Progress
-    factors_assessed: list  = field(default_factory=list)
-    factors_remaining: list = field(default_factory=list)
-    step_count:        int  = 0
-    max_steps:         int  = 8
-    cumulative_reward: float = 0.0
-
-    # Feedback
-    last_action_valid: bool         = True
-    feedback:          str          = ""
-    final_decision:    Optional[str] = None
+    factors_assessed:    List[str]      = []
+    factors_remaining:   List[str]      = []
+    step_count:          int            = 0
+    max_steps:           int            = 8
+    cumulative_reward:   float          = 0.0
+    last_action_valid:   bool           = True
+    feedback:            str            = ""
+    final_decision:      Optional[str]  = None
 
 
-# ---------------------------------------------------------------------------
-# LoanState — full server-side snapshot (GET /state)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class LoanState:
+class LoanState(State):
     """
-    Complete internal environment state — returned by GET /state.
-    Contains ground truth which is hidden from the agent mid-episode.
-
-    Base fields (match OpenEnv State contract)
-    ------------------------------------------
-    episode_id : str  — unique ID set on each reset().
-    step_count : int  — incremented each valid step().
-    metadata   : dict — reserved for framework use.
+    Full internal state — includes ground truth. Used by /state endpoint.
+    Inherits State (Pydantic BaseModel).
     """
-
-    # OpenEnv base contract fields
-    episode_id: str  = ""
-    step_count: int  = 0
-    metadata:   dict = field(default_factory=dict)
-
-    # Identification
-    task_id:        str = ""
-    application_id: str = ""
-
-    # Ground truth (server-side only — never shown to agent mid-episode)
-    ground_truth_decision:   str   = ""
-    ground_truth_risk_score: float = 0.0
-    factor_directions:       dict  = field(default_factory=dict)
-
-    # Progress
-    factors_assessed:  list         = field(default_factory=list)
-    cumulative_reward: float        = 0.0
-    final_decision:    Optional[str] = None
-
-    # Penalty accounting
-    penalty_total:       float = 0.0
-    correct_assessments: int   = 0
-
-    # Full action log (passed to graders at episode end)
-    action_log: list = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Self-test — python models.py
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import dataclasses
-
-    print("=" * 56)
-    print("  models.py — self-test")
-    print("=" * 56)
-
-    a = LoanAction(action_type="assess_credit_score", application_id="easy_01")
-    assert a.action_type in VALID_ACTIONS
-    print(f"  LoanAction     action_type={a.action_type}  ✓")
-
-    o = LoanObservation(application_id="easy_01", task_id="easy",
-                        loan_amount=80_000, done=False, reward=0.0)
-    assert o.credit_score is None
-    assert o.done is False
-    d = dataclasses.asdict(o)
-    assert "credit_score" in d and "done" in d
-    print(f"  LoanObservation credit_score=None  done=False  asdict() ✓")
-
-    s = LoanState(episode_id="ep_001", task_id="easy",
-                  ground_truth_decision="approve")
-    assert s.episode_id == "ep_001"
-    sd = dataclasses.asdict(s)
-    assert "ground_truth_decision" in sd
-    print(f"  LoanState      episode_id={s.episode_id}  asdict() ✓")
-
-    assert len(VALID_ACTIONS) == 9
-    assert len(ACTION_TO_FACTOR) == 6
-    print(f"  9 valid actions, 6 factor mappings  ✓")
-    print("\n  All assertions passed.\n")
+    episode_id:              str            = ""
+    step_count:              int            = 0
+    metadata:                Dict[str, Any] = {}
+    task_id:                 str            = ""
+    application_id:          str            = ""
+    ground_truth_decision:   str            = ""
+    ground_truth_risk_score: float          = 0.0
+    factor_directions:       Dict[str, str] = {}
+    factors_assessed:        List[str]      = []
+    cumulative_reward:       float          = 0.0
+    final_decision:          Optional[str]  = None
+    penalty_total:           float          = 0.0
+    correct_assessments:     int            = 0
+    action_log:              List[Dict[str, Any]] = []
