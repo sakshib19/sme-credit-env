@@ -3,6 +3,7 @@ title: SME Credit Risk RL Environment
 colorFrom: blue
 colorTo: green
 sdk: docker
+app_port: 8000
 pinned: false
 tags:
   - openenv
