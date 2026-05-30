@@ -115,7 +115,7 @@ elif [ "$HTTP_CODE" = "000" ]; then
   stop_at "Step 1"
 else
   fail "/reset returned HTTP $HTTP_CODE (expected 200)"
-  hint "Check Space build logs at https://huggingface.co/spaces/YOUR_USERNAME/sme-credit-env"
+  hint "Check Space build logs at https://huggingface.co/spaces/sakshib19/sme-credit-env"
   hint "Common causes: wrong port (need 8000 inside container), missing COPY tasks/ in Dockerfile"
   cat "$CURL_OUT" 2>/dev/null && printf "\n"
   stop_at "Step 1"

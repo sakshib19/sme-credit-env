@@ -512,7 +512,8 @@ def run_episode_remote(
         if verbose:
             print(f"\n  Step {step + 1}: {action_type}")
 
-        obs = _dict_to_obs(_post("/step", {"action_type": action_type, "application_id": obs.application_id}))
+        obs = _dict_to_obs(# Change this in inference.py:
+_post("/step", {"action": {"action_type": action_type, "application_id": obs.application_id}}))
         step += 1
         reward = obs.reward if obs.reward is not None else 0.0
         rewards.append(reward)
