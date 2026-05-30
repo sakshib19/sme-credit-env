@@ -24,7 +24,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from fastapi import HTTPException
+from fastapi import HTTPException, FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -71,6 +72,37 @@ def health():
     """Liveness probe — validator and HF health check ping this."""
     return {"status": "healthy", "env": "sme-credit-env", "tasks": 50}
 
+@app.get("/", response_class=HTMLResponse)
+def root_dashboard():
+    return """
+    <html>
+        <head>
+            <title>SME Credit Risk RL Environment</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; background-color: #f4f6f9; color: #333; }
+                .container { max-width: 600px; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+                h1 { color: #1e3a8a; }
+                .status { display: inline-block; padding: 5px 10px; background: #22c55e; color: white; border-radius: 4px; font-weight: bold; }
+                code { background: #e2e8f0; padding: 2px 6px; border-radius: 4px; font-family: monospace; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>SME Credit Risk RL Environment</h1>
+                <p>Status: <span class="status">ONLINE</span></p>
+                <p>The OpenEnv-compliant reinforcement learning environment server is running successfully on Hugging Face Spaces.</p>
+                <h3>Available Endpoints:</h3>
+                <ul>
+                    <li><code>GET /health</code> - Liveness check</li>
+                    <li><code>POST /reset</code> - Reset environment state</li>
+                    <li><code>POST /step</code> - Take action in the environment</li>
+                    <li><code>POST /recommend</code> - Baseline advisor policy</li>
+                </ul>
+                <p>Use your <code>inference.py</code> script pointing to this space URL to begin evaluation.</p>
+            </div>
+        </body>
+    </html>
+    """
 # ---------------------------------------------------------------------------
 # 3. Task Management & Grading Endpoints
 # ---------------------------------------------------------------------------
